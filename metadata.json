@@ -1,0 +1,5 @@
+{
+  "name": "SyrinxOne Bioacoustic Studio",
+  "description": "WebGL2 bioacoustic spectrogram viewer, measurement & annotation workstation, and AI Explorer connected to the SyrinxOne Cloud Run DSP & Acoustic Archive engine (MBARI, NOAA NCEI, Google Drive).",
+  "requestFramePermissions": []
+}
