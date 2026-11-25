@@ -1,24 +1,19 @@
 import type { DisplaySettings, SpectrogramMatrix, TimeFreqRange } from '@syrinxone/shared';
 import { buildColormapRGBA } from '../components/spectrogram/colormaps';
 
-/**
- * Renders a clean, cursor-free publication PNG of the active spectrogram (classic Syrinx
- * "Copy Bitmap of Current Window") and copies it to clipboard (with PNG download fallback).
- */
-export async function copySpectrogramImageToClipboard(
+export function renderSpectrogramToCanvas(
+  canvas: HTMLCanvasElement,
   matrix: SpectrogramMatrix,
   viewRange: TimeFreqRange,
   display: DisplaySettings,
-  title: string,
   width = 1000,
   height = 460,
-): Promise<'clipboard' | 'download'> {
+): void {
   const leftPad = display.showAxes ? 58 : 0;
   const bottomPad = display.showAxes ? 28 : 0;
-  const plotW = Math.max(100, width - leftPad);
-  const plotH = Math.max(80, height - bottomPad);
+  const plotW = Math.max(40, width - leftPad);
+  const plotH = Math.max(40, height - bottomPad);
 
-  const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
   const ctx = canvas.getContext('2d');
@@ -28,7 +23,6 @@ export async function copySpectrogramImageToClipboard(
   ctx.fillStyle = isLight ? '#ffffff' : '#0f141b';
   ctx.fillRect(0, 0, width, height);
 
-  // Render spectrogram pixels directly from Float32 matrix using the exact colormap LUT
   const imgData = ctx.createImageData(plotW, plotH);
   const lut = buildColormapRGBA(display.colormap);
   const dyn = Math.max(1, display.dynamicRangeDb);
@@ -91,6 +85,40 @@ export async function copySpectrogramImageToClipboard(
       ctx.fillText(`${t.toFixed(2)}s`, clampedX, plotH + 6);
     }
   }
+}
+
+export function renderSpectrogramPngBase64(
+  matrix: SpectrogramMatrix,
+  viewRange: TimeFreqRange,
+  display: DisplaySettings,
+  width = 960,
+  height = 420,
+): string | undefined {
+  try {
+    const canvas = document.createElement('canvas');
+    renderSpectrogramToCanvas(canvas, matrix, viewRange, display, width, height);
+    const dataUrl = canvas.toDataURL('image/png');
+    const comma = dataUrl.indexOf(',');
+    return comma >= 0 ? dataUrl.slice(comma + 1) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Renders a clean, cursor-free publication PNG of the active spectrogram (classic Syrinx
+ * "Copy Bitmap of Current Window") and copies it to clipboard (with PNG download fallback).
+ */
+export async function copySpectrogramImageToClipboard(
+  matrix: SpectrogramMatrix,
+  viewRange: TimeFreqRange,
+  display: DisplaySettings,
+  title: string,
+  width = 1000,
+  height = 460,
+): Promise<'clipboard' | 'download'> {
+  const canvas = document.createElement('canvas');
+  renderSpectrogramToCanvas(canvas, matrix, viewRange, display, width, height);
 
   const blob = await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('PNG export failed'))), 'image/png');

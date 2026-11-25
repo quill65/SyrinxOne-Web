@@ -1,14 +1,18 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  Activity,
   Camera,
   ChevronLeft,
   ChevronRight,
   Columns,
+  Database,
   FolderOpen,
   Grid,
   Keyboard,
   Layers,
+  LogOut,
   Maximize,
+  MoreHorizontal,
   PanelBottom,
   PanelRight,
   Play,
@@ -31,10 +35,14 @@ import { SpecSettingsPanel } from './components/dialogs/SpecSettingsPanel';
 import { AnnotationDrawer } from './components/annotations/AnnotationDrawer';
 import { HotkeyConfigModal } from './components/annotations/HotkeyConfigModal';
 import { KlipnSaveModal } from './components/dialogs/KlipnSaveModal';
+import { SourceModal } from './components/dialogs/SourceModal';
 import { FileBrowserModal } from './components/dialogs/FileBrowserModal';
 import { DetectSoundsModal } from './components/dialogs/DetectSoundsModal';
 import { EngineConnectionModal } from './components/dialogs/EngineConnectionModal';
 import { AiExplorerPanel } from './components/panels/AiExplorerPanel';
+import { ArchiveTimelineBar } from './components/mdi/ArchiveTimelineBar';
+import { GoogleSignInButton } from './components/auth/GoogleSignInButton';
+import { googleSignIn, initAuth, logout, toGoogleUserProfile } from './auth/googleAuth';
 
 declare global {
   interface Window {
@@ -47,11 +55,9 @@ export const App: React.FC = () => {
   const checkBackendHealth = useWorkspaceStore((s) => s.checkBackendHealth);
   const backendConnected = useWorkspaceStore((s) => s.backendConnected);
   const backendVersion = useWorkspaceStore((s) => s.backendVersion);
-  const statusMessage = useWorkspaceStore((s) => s.statusMessage);
   const errorMessage = useWorkspaceStore((s) => s.errorMessage);
   const setError = useWorkspaceStore((s) => s.setError);
   const setStatus = useWorkspaceStore((s) => s.setStatus);
-  const cursorReadout = useWorkspaceStore((s) => s.cursorReadout);
   const engine = useWorkspaceStore((s) => s.engine);
   const windows = useWorkspaceStore((s) => s.windows);
   const activeWindowId = useWorkspaceStore((s) => s.activeWindowId);
@@ -59,10 +65,14 @@ export const App: React.FC = () => {
   const specCache = useWorkspaceStore((s) => s.spectrogramCache);
   const selectedAnnotationId = useWorkspaceStore((s) => s.selectedAnnotationId);
 
+  const activeSourceDisplayName = useWorkspaceStore((s) => s.activeSourceDisplayName);
+  const mobilePane = useWorkspaceStore((s) => s.mobilePane);
+  const setMobilePane = useWorkspaceStore((s) => s.setMobilePane);
+  const openSourceSelector = useWorkspaceStore((s) => s.openSourceSelector);
+
   const showSpecPanel = useWorkspaceStore((s) => s.showSpecPanel);
   const showAiPanel = useWorkspaceStore((s) => s.showAiPanel);
   const showAnnotationDrawer = useWorkspaceStore((s) => s.showAnnotationDrawer);
-  const shiftArchiveWindow = useWorkspaceStore((s) => s.shiftArchiveWindow);
   const setModalState = useWorkspaceStore((s) => s.setModalState);
   const applyLayout = useWorkspaceStore((s) => s.applyLayout);
   const toggleAllTitlebars = useWorkspaceStore((s) => s.toggleAllTitlebars);
@@ -80,14 +90,97 @@ export const App: React.FC = () => {
   const importAnnotationsFromSource = useWorkspaceStore((s) => s.importAnnotationsFromSource);
   const exportDisplayJson = useWorkspaceStore((s) => s.exportDisplayJson);
   const importDisplayJson = useWorkspaceStore((s) => s.importDisplayJson);
+  const googleUser = useWorkspaceStore((s) => s.googleUser);
+  const hasDriveToken = useWorkspaceStore((s) => s.hasDriveToken);
+  const setGoogleAuthState = useWorkspaceStore((s) => s.setGoogleAuthState);
 
   const [playback, setPlayback] = useState<PlaybackState>(() => audioPlayer.getState());
+  const [googleSigningIn, setGoogleSigningIn] = useState(false);
+  const [isMobileViewport, setIsMobileViewport] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth <= 768 : false,
+  );
+  const [showMobileTools, setShowMobileTools] = useState(false);
+  const [dragOffsetPx, setDragOffsetPx] = useState(0);
+
+  const shellRef = useRef<HTMLDivElement | null>(null);
   const displayInputRef = useRef<HTMLInputElement | null>(null);
   const mergeDisplayFlagRef = useRef(false);
+  const swipeTouchRef = useRef<{
+    startX: number;
+    startY: number;
+    startTime: number;
+    locked: 'horizontal' | 'vertical' | null;
+    eligible: boolean;
+  } | null>(null);
 
   useEffect(() => audioPlayer.subscribe(setPlayback), []);
 
-  const handleOpenAudio = async () => {
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 768px)');
+    const onChange = () => setIsMobileViewport(mq.matches);
+    onChange();
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
+  // Keep mobile visualViewport synced when soft keyboard opens (keeps 3-screen swipe intact)
+  useEffect(() => {
+    const syncVv = () => {
+      const el = shellRef.current;
+      if (!el) return;
+      if (!isMobileViewport) {
+        el.style.removeProperty('--app-vv-height');
+        return;
+      }
+      const vv = window.visualViewport;
+      if (vv) {
+        el.style.setProperty('--app-vv-height', `${Math.max(240, Math.round(vv.height))}px`);
+      } else {
+        el.style.setProperty('--app-vv-height', `${window.innerHeight}px`);
+      }
+    };
+    syncVv();
+    const vv = window.visualViewport;
+    vv?.addEventListener('resize', syncVv);
+    window.addEventListener('resize', syncVv);
+    return () => {
+      vv?.removeEventListener('resize', syncVv);
+      window.removeEventListener('resize', syncVv);
+    };
+  }, [isMobileViewport]);
+
+  useEffect(() => {
+    return initAuth(
+      (user) => {
+        setGoogleAuthState(toGoogleUserProfile(user), true);
+      },
+      (user) => {
+        setGoogleAuthState(user ? toGoogleUserProfile(user) : null, false);
+      },
+    );
+  }, [setGoogleAuthState]);
+
+  const handleGoogleSignIn = async () => {
+    setGoogleSigningIn(true);
+    setError(null);
+    try {
+      const res = await googleSignIn();
+      setGoogleAuthState(toGoogleUserProfile(res.user), true);
+      setStatus(`Signed in with Google (${res.user.email ?? res.user.displayName ?? 'Drive ready'})`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Google sign-in failed');
+    } finally {
+      setGoogleSigningIn(false);
+    }
+  };
+
+  const handleGoogleSignOut = async () => {
+    await logout();
+    setGoogleAuthState(null, false);
+    setStatus('Signed out of Google');
+  };
+
+  const handleOpenRecordings = async () => {
     if (window.syrinxDesktop) {
       const paths = await window.syrinxDesktop.openAudioFilesDialog();
       for (const p of paths) {
@@ -153,18 +246,15 @@ export const App: React.FC = () => {
     if (!activeWin) return;
     const file = state.files[activeWin.fileId];
     if (!file) return;
-    if (activeWin.selection) {
-      const s = Math.min(activeWin.selection.startSec, activeWin.selection.endSec);
-      const en = Math.max(activeWin.selection.startSec, activeWin.selection.endSec);
-      void audioPlayer.play(state.engine, file.fileId, s, en);
-    } else {
-      void audioPlayer.play(
-        state.engine,
-        file.fileId,
-        activeWin.viewRange.startSec,
-        activeWin.viewRange.endSec,
-      );
-    }
+    const start = activeWin.selection
+      ? Math.min(activeWin.selection.startSec, activeWin.selection.endSec)
+      : activeWin.viewRange.startSec;
+    const end = activeWin.selection
+      ? Math.max(activeWin.selection.startSec, activeWin.selection.endSec)
+      : activeWin.viewRange.endSec;
+    void audioPlayer.play(state.engine, file.fileId, start, end).catch((err) => {
+      setError(err instanceof Error ? err.message : 'Unable to play audio');
+    });
   };
 
   // Initialize backend connection (Electron local sidecar OR Web server)
@@ -178,7 +268,7 @@ export const App: React.FC = () => {
         cleanupMenu = window.syrinxDesktop.onMenuCommand((cmd) => {
           const curWinId = useWorkspaceStore.getState().activeWindowId;
           if (cmd === 'open-audio') {
-            void handleOpenAudio();
+            void handleOpenRecordings();
           } else if (cmd === 'open-annotations') {
             void (async () => {
               const path = await window.syrinxDesktop?.openAnnotationFileDialog();
@@ -358,6 +448,90 @@ export const App: React.FC = () => {
     engine,
   ]);
 
+  const handleSwipeTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (!isMobileViewport || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const target = e.target as HTMLElement | null;
+
+    if (
+      target &&
+      (target.closest('input, select, textarea') ||
+        target.closest('.mobile-tab-strip') ||
+        target.closest('.archive-bar-scrubber') ||
+        target.closest('.spec-scrollbar-wrap'))
+    ) {
+      swipeTouchRef.current = null;
+      return;
+    }
+
+    const inCanvas = Boolean(target?.closest('.spec-view-root canvas'));
+    const inEdgeZone = t.clientX <= 24 || t.clientX >= window.innerWidth - 24;
+    if (mobilePane === 1 && inCanvas && !inEdgeZone) {
+      swipeTouchRef.current = null;
+      return;
+    }
+
+    swipeTouchRef.current = {
+      startX: t.clientX,
+      startY: t.clientY,
+      startTime: Date.now(),
+      locked: null,
+      eligible: true,
+    };
+  };
+
+  const handleSwipeTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    const st = swipeTouchRef.current;
+    if (!st || !st.eligible || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const dx = t.clientX - st.startX;
+    const dy = t.clientY - st.startY;
+
+    if (st.locked === null) {
+      if (Math.abs(dx) < 12 && Math.abs(dy) < 12) return;
+      if (Math.abs(dx) > Math.abs(dy) * 1.25) {
+        st.locked = 'horizontal';
+      } else {
+        st.locked = 'vertical';
+        return;
+      }
+    }
+    if (st.locked !== 'horizontal') return;
+
+    // Dampen overscroll at screen edges (pane 0 right / pane 2 left)
+    let clamped = dx;
+    if ((mobilePane === 0 && dx > 0) || (mobilePane === 2 && dx < 0)) {
+      clamped = dx * 0.25;
+    }
+    setDragOffsetPx(clamped);
+  };
+
+  const handleSwipeTouchEnd = () => {
+    const st = swipeTouchRef.current;
+    swipeTouchRef.current = null;
+    if (!st || st.locked !== 'horizontal') {
+      setDragOffsetPx(0);
+      return;
+    }
+    const elapsed = Math.max(1, Date.now() - st.startTime);
+    const velocity = Math.abs(dragOffsetPx) / elapsed;
+    const threshold = Math.min(80, window.innerWidth * 0.2);
+
+    let nextPane: 0 | 1 | 2 = mobilePane;
+    if ((dragOffsetPx > threshold || (dragOffsetPx > 28 && velocity > 0.35)) && mobilePane > 0) {
+      nextPane = (mobilePane - 1) as 0 | 1 | 2;
+    } else if (
+      (dragOffsetPx < -threshold || (dragOffsetPx < -28 && velocity > 0.35)) &&
+      mobilePane < 2
+    ) {
+      nextPane = (mobilePane + 1) as 0 | 1 | 2;
+    }
+    setDragOffsetPx(0);
+    if (nextPane !== mobilePane) {
+      setMobilePane(nextPane);
+    }
+  };
+
   const activeWin = windows.find((w) => w.windowId === activeWindowId);
   const activeFile = activeWin ? files[activeWin.fileId] : undefined;
   const activeSpecReady = Boolean(
@@ -365,7 +539,7 @@ export const App: React.FC = () => {
   );
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" ref={shellRef}>
       <header className="top-toolbar">
         <button
           className="brand brand-btn"
@@ -373,19 +547,31 @@ export const App: React.FC = () => {
           title="Configure Python Engine URL (Cloud Run / Local)"
         >
           <span className="brand-mark">S1</span>
-          <span className="brand-name">SyrinxOne</span>
+          <span className="brand-name desktop-only">SyrinxOne</span>
           <span
             className={`conn-dot ${backendConnected ? 'ok' : 'down'}`}
             title={backendConnected ? `Engine v${backendVersion}` : 'Engine offline — click to configure URL'}
           />
         </button>
 
+        {/* Primary Separated Flows: Source + Recordings */}
         <div className="toolbar-group">
-          <button className="btn-small btn-primary" onClick={() => void handleOpenAudio()}>
-            <FolderOpen size={13} /> Open
+          <button
+            className="btn-small"
+            onClick={() => openSourceSelector(false)}
+            title={`Active Source: ${activeSourceDisplayName} — click to change or connect sources`}
+          >
+            <Database size={13} />
+            <span>Source</span>
+            <span className="desktop-only toolbar-source-name">· {activeSourceDisplayName}</span>
           </button>
-          <button className="btn-small" onClick={() => setModalState('showFileBrowser', true)}>
-            Sources
+          <button
+            className="btn-small btn-primary"
+            onClick={() => void handleOpenRecordings()}
+            title="Browse & select single or combined recordings from the active source"
+          >
+            <FolderOpen size={13} />
+            <span>Recordings</span>
           </button>
           <button
             className="btn-small desktop-only"
@@ -463,35 +649,49 @@ export const App: React.FC = () => {
           </button>
         </div>
 
+        {/* Transport: Single compact Play/Stop toggle on mobile, full transport on desktop */}
         <div className="toolbar-group">
-          <button className="btn-small" onClick={handlePlayActive} title="Play active view or selection (Space / P)">
-            <Play size={13} />
-          </button>
-          <button className="btn-small" onClick={() => audioPlayer.stop()} title="Stop playback">
-            <Square size={12} />
-          </button>
-          <button
-            className={`btn-small ${playback.loop ? 'btn-active' : ''}`}
-            onClick={() => audioPlayer.setLoop(!playback.loop)}
-            title="Toggle loop playback"
-          >
-            <Repeat size={12} />
-          </button>
-          <select
-            className="rate-select"
-            value={playback.playbackRate}
-            onChange={(e) => audioPlayer.setPlaybackRate(Number(e.target.value))}
-            title="Playback Speed"
-          >
-            <option value={0.25}>0.25×</option>
-            <option value={0.5}>0.5×</option>
-            <option value={1}>1.0×</option>
-            <option value={1.5}>1.5×</option>
-            <option value={2}>2.0×</option>
-          </select>
+          {isMobileViewport ? (
+            <button
+              className={`btn-small ${playback.isPlaying ? 'btn-active' : ''}`}
+              disabled={!activeWin}
+              onClick={() => (playback.isPlaying ? audioPlayer.stop() : handlePlayActive())}
+              title={playback.isPlaying ? 'Stop playback' : 'Play active view or selection'}
+            >
+              {playback.isPlaying ? <Square size={12} /> : <Play size={13} />}
+            </button>
+          ) : (
+            <>
+              <button className="btn-small" onClick={handlePlayActive} title="Play active view or selection (Space / P)">
+                <Play size={13} />
+              </button>
+              <button className="btn-small" onClick={() => audioPlayer.stop()} title="Stop playback">
+                <Square size={12} />
+              </button>
+              <button
+                className={`btn-small ${playback.loop ? 'btn-active' : ''}`}
+                onClick={() => audioPlayer.setLoop(!playback.loop)}
+                title="Toggle loop playback"
+              >
+                <Repeat size={12} />
+              </button>
+              <select
+                className="rate-select"
+                value={playback.playbackRate}
+                onChange={(e) => audioPlayer.setPlaybackRate(Number(e.target.value))}
+                title="Playback Speed"
+              >
+                <option value={0.25}>0.25×</option>
+                <option value={0.5}>0.5×</option>
+                <option value={1}>1.0×</option>
+                <option value={1.5}>1.5×</option>
+                <option value={2}>2.0×</option>
+              </select>
+            </>
+          )}
         </div>
 
-        <div className="toolbar-group">
+        <div className="toolbar-group desktop-only">
           <button
             className="btn-small"
             disabled={!activeWin?.selection}
@@ -527,31 +727,38 @@ export const App: React.FC = () => {
 
         <div className="toolbar-spacer" />
 
-        {activeWin && activeFile?.isPartialWindow && (
-          <div className="toolbar-group" title="Navigate time slices of a large cloud archive recording">
-            <span className="window-badge mono">
-              {Math.round(activeFile.windowStartSec ?? 0)}–
-              {Math.round((activeFile.windowStartSec ?? 0) + activeFile.durationSec)}s /{' '}
-              {Math.round(activeFile.totalDurationSec ?? activeFile.durationSec)}s
-            </span>
-            <button
-              className="btn-small"
-              onClick={() => void shiftArchiveWindow(activeWin.windowId, -1)}
-              title="Load previous time window"
-            >
-              <ChevronLeft size={12} /> Win
-            </button>
-            <button
-              className="btn-small"
-              onClick={() => void shiftArchiveWindow(activeWin.windowId, 1)}
-              title="Load next time window"
-            >
-              Win <ChevronRight size={12} />
-            </button>
-          </div>
-        )}
+        <div className="toolbar-group desktop-only">
+          {hasDriveToken ? (
+            <>
+              <button
+                className="btn-small gsi-account-chip"
+                onClick={() => openSourceSelector(false)}
+                title={`Signed in as ${googleUser?.email ?? 'Google User'}`}
+              >
+                <span className="gsi-account-dot" />
+                <span className="gsi-account-label">
+                  {googleUser?.email ?? googleUser?.displayName ?? 'Google Drive'}
+                </span>
+              </button>
+              <button
+                className="btn-small"
+                onClick={() => void handleGoogleSignOut()}
+                title="Sign out of Google"
+              >
+                <LogOut size={12} />
+              </button>
+            </>
+          ) : (
+            <GoogleSignInButton
+              compact
+              disabled={googleSigningIn}
+              label={googleSigningIn ? 'Signing in...' : googleUser ? 'Reconnect Google' : 'Sign in with Google'}
+              onClick={() => void handleGoogleSignIn()}
+            />
+          )}
+        </div>
 
-        <div className="toolbar-group">
+        <div className="toolbar-group desktop-only">
           <button
             className={`btn-small ${showAiPanel ? 'btn-active' : ''}`}
             onClick={() => setModalState('showAiPanel', !showAiPanel)}
@@ -574,6 +781,112 @@ export const App: React.FC = () => {
             <PanelBottom size={13} />
           </button>
         </div>
+
+        {/* Mobile Compact Overflow Menu */}
+        {isMobileViewport && (
+          <div className="mobile-tools-wrap">
+            <button
+              className={`btn-small ${showMobileTools ? 'btn-active' : ''}`}
+              onClick={() => setShowMobileTools((v) => !v)}
+              title="Playback, Detector, Clip & Tools"
+            >
+              <MoreHorizontal size={15} />
+            </button>
+
+            {showMobileTools && (
+              <>
+                <div className="mobile-tools-backdrop" onClick={() => setShowMobileTools(false)} />
+                <div className="mobile-tools-menu" onClick={(e) => e.stopPropagation()}>
+                  <div className="mobile-tools-row">
+                    <button
+                      className={`btn-small ${playback.loop ? 'btn-active' : ''}`}
+                      onClick={() => audioPlayer.setLoop(!playback.loop)}
+                    >
+                      <Repeat size={12} /> Loop
+                    </button>
+                    <select
+                      className="rate-select"
+                      value={playback.playbackRate}
+                      onChange={(e) => audioPlayer.setPlaybackRate(Number(e.target.value))}
+                    >
+                      <option value={0.25}>0.25×</option>
+                      <option value={0.5}>0.5×</option>
+                      <option value={1}>1.0×</option>
+                      <option value={1.5}>1.5×</option>
+                      <option value={2}>2.0×</option>
+                    </select>
+                  </div>
+
+                  <button
+                    disabled={!activeWin}
+                    onClick={() => {
+                      setShowMobileTools(false);
+                      setModalState('showDetectModal', true);
+                    }}
+                  >
+                    <Radar size={13} /> Detect Sounds
+                  </button>
+                  <button
+                    disabled={!activeWin?.selection}
+                    onClick={() => {
+                      setShowMobileTools(false);
+                      setModalState('showKlipModal', true);
+                    }}
+                  >
+                    <Scissors size={13} /> Clip Selection
+                  </button>
+                  <button
+                    onClick={() => {
+                      setShowMobileTools(false);
+                      setMobilePane(1);
+                      setModalState('showAnnotationDrawer', !showAnnotationDrawer);
+                    }}
+                  >
+                    <PanelBottom size={13} /> {showAnnotationDrawer ? 'Hide Annotations' : 'Annotations'}
+                  </button>
+                  <button
+                    disabled={!activeSpecReady}
+                    onClick={() => {
+                      setShowMobileTools(false);
+                      void handleCopyActiveImage();
+                    }}
+                  >
+                    <Camera size={13} /> Copy Spectrogram PNG
+                  </button>
+                  <button
+                    onClick={() => {
+                      setShowMobileTools(false);
+                      setModalState('showHotkeyModal', true);
+                    }}
+                  >
+                    <Keyboard size={13} /> Annotation Hotkeys
+                  </button>
+                  <hr />
+                  {hasDriveToken ? (
+                    <button
+                      onClick={() => {
+                        setShowMobileTools(false);
+                        void handleGoogleSignOut();
+                      }}
+                    >
+                      <LogOut size={13} /> Sign out ({googleUser?.email ?? 'Google'})
+                    </button>
+                  ) : (
+                    <button
+                      disabled={googleSigningIn}
+                      onClick={() => {
+                        setShowMobileTools(false);
+                        void handleGoogleSignIn();
+                      }}
+                    >
+                      Sign in with Google
+                    </button>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        )}
       </header>
 
       {errorMessage && (
@@ -585,39 +898,90 @@ export const App: React.FC = () => {
         </div>
       )}
 
-      <div className="workspace-main">
-        <div className="workspace-center">
-          <MDIWorkspace />
-          {showAnnotationDrawer && <AnnotationDrawer />}
-        </div>
-        {showSpecPanel && <SpecSettingsPanel />}
-        {showAiPanel && <AiExplorerPanel />}
-      </div>
+      {isMobileViewport ? (
+        <>
+          <nav className="mobile-pane-bar" aria-label="Workspace Views">
+            <button
+              type="button"
+              className={`mobile-pane-tab ${mobilePane === 0 ? 'active' : ''}`}
+              onClick={() => setMobilePane(0)}
+            >
+              <SlidersHorizontal size={13} />
+              <span>Settings</span>
+            </button>
+            <button
+              type="button"
+              className={`mobile-pane-tab ${mobilePane === 1 ? 'active' : ''}`}
+              onClick={() => setMobilePane(1)}
+            >
+              <Activity size={13} />
+              <span>Spectrogram</span>
+            </button>
+            <button
+              type="button"
+              className={`mobile-pane-tab ${mobilePane === 2 ? 'active' : ''}`}
+              onClick={() => setMobilePane(2)}
+            >
+              <Sparkles size={13} />
+              <span>AI</span>
+            </button>
+            <div
+              className="mobile-pane-indicator"
+              style={{ transform: `translate3d(${mobilePane * 100}%, 0, 0)` }}
+            />
+          </nav>
 
-      <footer className="status-bar">
-        <span className="status-msg">{statusMessage}</span>
-        <div className="cursor-readout mono">
-          {cursorReadout ? (
-            <>
-              <span>Ch {cursorReadout.channel}</span>
-              <span>t = {cursorReadout.timeSec.toFixed(4)} s</span>
-              <span>f = {Math.round(cursorReadout.freqHz)} Hz</span>
-              {cursorReadout.valueDb !== undefined && (
-                <span>{cursorReadout.valueDb.toFixed(1)} dB</span>
-              )}
-            </>
-          ) : (
-            <span>Right-click spectrogram for tools · Double-click to play · Alt+←/→ prev/next file</span>
-          )}
-          {activeWin?.selection && (
-            <span className="sel-readout">
-              Sel: Δt = {Math.abs(activeWin.selection.endSec - activeWin.selection.startSec).toFixed(3)}s,
-              Δf = {Math.round(Math.abs(activeWin.selection.highFreqHz - activeWin.selection.lowFreqHz))}Hz
-            </span>
-          )}
-        </div>
-      </footer>
+          <div
+            className="mobile-swipe-viewport"
+            onTouchStart={handleSwipeTouchStart}
+            onTouchMove={handleSwipeTouchMove}
+            onTouchEnd={handleSwipeTouchEnd}
+            onTouchCancel={handleSwipeTouchEnd}
+          >
+            <div
+              className={`mobile-swipe-track ${dragOffsetPx !== 0 ? 'dragging' : ''}`}
+              style={{
+                transform: `translate3d(calc(-${mobilePane * 100}% + ${dragOffsetPx}px), 0, 0)`,
+              }}
+            >
+              <div className="mobile-swipe-pane">
+                <SpecSettingsPanel />
+              </div>
 
+              <div className="mobile-swipe-pane mobile-center-pane">
+                {activeWin && activeFile?.isPartialWindow && (
+                  <ArchiveTimelineBar win={activeWin} file={activeFile} />
+                )}
+                <div className="workspace-center">
+                  <MDIWorkspace />
+                  {showAnnotationDrawer && <AnnotationDrawer />}
+                </div>
+              </div>
+
+              <div className="mobile-swipe-pane">
+                <AiExplorerPanel />
+              </div>
+            </div>
+          </div>
+        </>
+      ) : (
+        <>
+          {activeWin && activeFile?.isPartialWindow && (
+            <ArchiveTimelineBar win={activeWin} file={activeFile} />
+          )}
+
+          <div className="workspace-main">
+            <div className="workspace-center">
+              <MDIWorkspace />
+              {showAnnotationDrawer && <AnnotationDrawer />}
+            </div>
+            {showSpecPanel && <SpecSettingsPanel />}
+            {showAiPanel && <AiExplorerPanel />}
+          </div>
+        </>
+      )}
+
+      <SourceModal />
       <FileBrowserModal />
       <EngineConnectionModal />
       <HotkeyConfigModal />

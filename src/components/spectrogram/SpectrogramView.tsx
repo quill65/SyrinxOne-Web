@@ -1,8 +1,22 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type { AnnotationRecord, AudioFileInfo, MDIWindowState, SelectionBox } from '@syrinxone/shared';
+import type {
+  AnnotationRecord,
+  AudioFileInfo,
+  MDIWindowState,
+  SelectionBox,
+  SpectrogramMatrix,
+} from '@syrinxone/shared';
 import { getCachedSpectrogram, useWorkspaceStore } from '../../store/workspaceStore';
 import { audioPlayer, type PlaybackState } from '../../audio/WebAudioPlayer';
 import { copySpectrogramImageToClipboard } from '../../utils/exportImage';
+import { isCombinedFileId } from '../../utils/combinedEngine';
+import { fetchSpectrogramAdaptive } from '../../utils/spectrogramFetch';
+import {
+  buildRecordingTimeContext,
+  formatAxisTickTime,
+  isLongRecording,
+  resolveRecordingStartMs,
+} from '../../utils/timeFormat';
 import { WaveformCanvas } from './WaveformCanvas';
 import { WebGLSpectrogramCanvas } from './WebGLSpectrogramCanvas';
 
@@ -112,11 +126,14 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
   const setModalState = useWorkspaceStore((s) => s.setModalState);
   const setStatus = useWorkspaceStore((s) => s.setStatus);
   const setError = useWorkspaceStore((s) => s.setError);
+  const autoGainMode = useWorkspaceStore((s) => s.windowAutoGainMode[win.windowId] ?? 'manual');
+  const normalizeWindowGain = useWorkspaceStore((s) => s.normalizeWindowGain);
 
   const [playback, setPlayback] = useState<PlaybackState>(() => audioPlayer.getState());
   const [cursorStyle, setCursorStyle] = useState<string>('crosshair');
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [touchMode, setTouchMode] = useState<'select' | 'pan'>('select');
+  const [zoomMatrix, setZoomMatrix] = useState<SpectrogramMatrix | null>(null);
 
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
   const lastTapRef = useRef<number>(0);
@@ -160,6 +177,102 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
   const spanT = Math.max(1e-6, win.viewRange.endSec - win.viewRange.startSec);
   const needsScrollbar =
     win.displaySettings.timeScaleMode === 'fixed' || spanT < file.durationSec - 0.005;
+
+  useEffect(() => {
+    setZoomMatrix(null);
+  }, [
+    file.fileId,
+    file.windowStartSec,
+    file.durationSec,
+    win.specParams.channel,
+    win.specParams.fftSize,
+    win.specParams.hopSize,
+    win.specParams.dspMode,
+  ]);
+
+  // Automatically fetch high-resolution STFT slice when zooming into a downsampled multi-hour spectrogram
+  useEffect(() => {
+    if (!matrix || win.displaySettings.renderMode === 'server_bitmap') {
+      setZoomMatrix(null);
+      return;
+    }
+    const nativeStep = Math.min(win.specParams.hopSize, win.specParams.fftSize) / Math.max(1, file.sampleRate);
+    const isDownsampledOverview = matrix.timeStepSec > nativeStep * 1.5;
+    if (!isDownsampledOverview || spanT >= file.durationSec * 0.45) {
+      setZoomMatrix(null);
+      return;
+    }
+    if (
+      zoomMatrix &&
+      zoomMatrix.fileId === file.fileId &&
+      zoomMatrix.channel === win.specParams.channel &&
+      zoomMatrix.startSec <= win.viewRange.startSec + 0.01 &&
+      zoomMatrix.endSec >= win.viewRange.endSec - 0.01 &&
+      zoomMatrix.endSec - zoomMatrix.startSec <= spanT * 2.5
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      const pad = spanT * 0.25;
+      const reqStart = Math.max(0, win.viewRange.startSec - pad);
+      const reqEnd = Math.min(file.durationSec, win.viewRange.endSec + pad);
+      void fetchSpectrogramAdaptive(engine, file, win.specParams, {
+        startSec: reqStart,
+        endSec: reqEnd,
+      })
+        .then((hiRes) => {
+          if (!cancelled) setZoomMatrix(hiRes);
+        })
+        .catch(() => {
+          // keep overview matrix cleanly if zoom fetch fails
+        });
+    }, 240);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    engine,
+    file,
+    matrix,
+    win.specParams,
+    win.viewRange.startSec,
+    win.viewRange.endSec,
+    win.displaySettings.renderMode,
+    spanT,
+    zoomMatrix,
+  ]);
+
+  const activeRenderMatrix =
+    zoomMatrix &&
+    zoomMatrix.fileId === file.fileId &&
+    zoomMatrix.channel === win.specParams.channel &&
+    zoomMatrix.startSec <= win.viewRange.startSec + 0.05 &&
+    zoomMatrix.endSec >= win.viewRange.endSec - 0.05
+      ? zoomMatrix
+      : matrix;
+
+  // Keep contrast normalized to visible viewport when Auto-normalize is enabled
+  useEffect(() => {
+    if (autoGainMode !== 'auto' || !activeRenderMatrix) return;
+    normalizeWindowGain(win.windowId, {
+      scope: 'view',
+      matrix: activeRenderMatrix,
+      silent: true,
+    });
+  }, [
+    autoGainMode,
+    activeRenderMatrix,
+    normalizeWindowGain,
+    win.windowId,
+    win.viewRange.startSec,
+    win.viewRange.endSec,
+    win.viewRange.minFreqHz,
+    win.viewRange.maxFreqHz,
+  ]);
 
   const showAxes = win.displaySettings.showAxes;
   const showWave = win.displaySettings.showWaveform;
@@ -260,14 +373,25 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         }
       }
 
-      const tTicks = computeNiceTicks(startSec, endSec, Math.floor(plotW / 75));
+      const windowOffsetSec = file.windowStartSec ?? 0;
+      const combinedSegs = isCombinedFileId(file.fileId)
+        ? engine.getCombinedRecording(file.fileId)?.segments
+        : undefined;
+      const timeCtx = buildRecordingTimeContext(file, combinedSegs);
+      const startMs = resolveRecordingStartMs(timeCtx);
+      const longRec = isLongRecording(file.totalDurationSec ?? file.durationSec, startMs);
+      const tickSpacing = longRec ? (startMs !== null ? 116 : 98) : 80;
+      const edgePad = longRec ? 36 : 20;
+
+      const tTicks = computeNiceTicks(startSec, endSec, Math.floor(plotW / tickSpacing));
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
       for (const t of tTicks) {
         const x = timeToX(t);
-        if (x < leftPad + 16 || x > width - 16) continue;
+        if (x < leftPad + edgePad || x > width - edgePad) continue;
         ctx.fillStyle = '#94a3b8';
-        ctx.fillText(`${t.toFixed(spanT < 2 ? 2 : 1)}s`, x, waveH + plotH + 6);
+        const label = formatAxisTickTime(windowOffsetSec + t, spanT, timeCtx);
+        ctx.fillText(label, x, waveH + plotH + 6);
         ctx.strokeStyle = '#475569';
         ctx.beginPath();
         ctx.moveTo(x, waveH + plotH);
@@ -378,6 +502,13 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     visibleAnnotations,
     selectedAnnotationId,
     playheadSec,
+    file.fileId,
+    file.name,
+    file.startDateTimeIso,
+    file.windowStartSec,
+    file.totalDurationSec,
+    file.durationSec,
+    engine,
   ]);
 
   const coordsToTimeFreq = (clientX: number, clientY: number) => {
@@ -645,6 +776,12 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     }
   };
 
+  const playRange = (s?: number, e?: number) => {
+    void audioPlayer.play(engine, file.fileId, s, e).catch((err) => {
+      setError(err instanceof Error ? err.message : 'Unable to play audio');
+    });
+  };
+
   // Classic Syrinx: double-click plays annotation under cursor or the file
   const handleDoubleClick = (e: React.MouseEvent) => {
     const pt = coordsToTimeFreq(e.clientX, e.clientY);
@@ -652,9 +789,9 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     const hit = findAnnotationAt(pt.timeSec, pt.freqHz);
     if (hit) {
       selectAnnotation(hit.id, false);
-      void audioPlayer.play(engine, file.fileId, hit.startTimeSec, hit.endTimeSec);
+      playRange(hit.startTimeSec, hit.endTimeSec);
     } else {
-      void audioPlayer.play(engine, file.fileId, win.viewRange.startSec, win.viewRange.endSec);
+      playRange(win.viewRange.startSec, win.viewRange.endSec);
     }
   };
 
@@ -738,20 +875,21 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     if (now - lastTapRef.current < 280) {
       lastTapRef.current = 0;
       if (win.selection) {
-        void audioPlayer.play(
-          engine,
-          file.fileId,
+        playRange(
           Math.min(win.selection.startSec, win.selection.endSec),
           Math.max(win.selection.startSec, win.selection.endSec),
         );
       } else {
-        void audioPlayer.play(engine, file.fileId, startSec, endSec);
+        playRange(startSec, endSec);
       }
       return;
     }
     lastTapRef.current = now;
 
     const touch = e.touches[0];
+    if (window.innerWidth <= 768 && (touch.clientX <= 24 || touch.clientX >= window.innerWidth - 24)) {
+      return;
+    }
     const { x, y, t, f } = clientToPlot(touch.clientX, touch.clientY);
     if (x < leftPad || y < waveH || y > waveH + plotH) return;
 
@@ -872,7 +1010,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
 
       <div style={{ position: 'absolute', left: leftPad, top: waveH }}>
         <WebGLSpectrogramCanvas
-          matrix={matrix}
+          matrix={activeRenderMatrix}
           viewRange={win.viewRange}
           displaySettings={win.displaySettings}
           bitmapFallbackUrl={bitmapFallbackUrl}
@@ -981,7 +1119,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
               <button
                 onClick={() => {
                   const a = contextMenu.annotation!;
-                  void audioPlayer.play(engine, file.fileId, a.startTimeSec, a.endTimeSec);
+                  playRange(a.startTimeSec, a.endTimeSec);
                   setContextMenu(null);
                 }}
               >
@@ -1037,14 +1175,12 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
           <button
             onClick={() => {
               if (win.selection) {
-                void audioPlayer.play(
-                  engine,
-                  file.fileId,
+                playRange(
                   Math.min(win.selection.startSec, win.selection.endSec),
                   Math.max(win.selection.startSec, win.selection.endSec),
                 );
               } else {
-                void audioPlayer.play(engine, file.fileId, startSec, endSec);
+                playRange(startSec, endSec);
               }
               setContextMenu(null);
             }}
@@ -1094,6 +1230,17 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
             }}
           >
             Reset Full View (Ctrl+0)
+          </button>
+          <button
+            onClick={() => {
+              normalizeWindowGain(win.windowId, {
+                scope: win.selection ? 'selection' : 'view',
+                matrix: activeRenderMatrix,
+              });
+              setContextMenu(null);
+            }}
+          >
+            {win.selection ? 'Normalize Contrast (Selection)' : 'Normalize Contrast (View)'}
           </button>
 
           <hr />

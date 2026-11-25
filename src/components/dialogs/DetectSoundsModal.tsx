@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { Radar, X } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/workspaceStore';
+import { isCombinedFileId } from '../../utils/combinedEngine';
+import { formatDurationCompact } from '../../utils/spectrogramFetch';
 
 export const DetectSoundsModal: React.FC = () => {
   const show = useWorkspaceStore((s) => s.showDetectModal);
@@ -30,8 +32,13 @@ export const DetectSoundsModal: React.FC = () => {
   const [comment, setComment] = useState('Detected');
   const [replaceExisting, setReplaceExisting] = useState(false);
   const [saveClips, setSaveClips] = useState(false);
+  const [scanViewportOnly, setScanViewportOnly] = useState(false);
   const [busy, setBusy] = useState(false);
   const [summary, setSummary] = useState<string | null>(null);
+  const combinedRec =
+    activeFile && isCombinedFileId(activeFile.fileId)
+      ? engine.getCombinedRecording(activeFile.fileId)
+      : undefined;
 
   useEffect(() => {
     if (!show || !suggestedDetectParams) return;
@@ -68,6 +75,12 @@ export const DetectSoundsModal: React.FC = () => {
         popFilter,
         comment,
         saveClips,
+        ...(scanViewportOnly
+          ? {
+              startSec: Math.max(0, activeWin.viewRange.startSec),
+              endSec: Math.min(activeFile.durationSec, activeWin.viewRange.endSec),
+            }
+          : {}),
         targetSourceId: activeFile.sourceId === 'upload' ? 'local' : activeFile.sourceId,
       });
       addDetectedAnnotations(resp.detections, replaceExisting ? activeFile.name : undefined);
@@ -102,8 +115,11 @@ export const DetectSoundsModal: React.FC = () => {
             <>
               <p className="modal-hint">
                 Target: <strong>{activeFile.name}</strong> (Ch {(activeWin?.specParams.channel ?? 0) + 1},{' '}
-                {activeFile.durationSec.toFixed(2)}s). Detections are added as editable annotation
-                boxes on the spectrogram.
+                {formatDurationCompact(activeFile.durationSec)}
+                {combinedRec
+                  ? ` · Combined ${combinedRec.segments.length} segments (${formatDurationCompact(combinedRec.totalDurationSec)} total)`
+                  : ''}
+                ). Detections are added as editable annotation boxes on the spectrogram.
               </p>
 
               <div className="detect-grid">
@@ -204,6 +220,16 @@ export const DetectSoundsModal: React.FC = () => {
                     onChange={(e) => setReplaceExisting(e.target.checked)}
                   />
                   Replace existing annotations on this file
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={scanViewportOnly}
+                    onChange={(e) => setScanViewportOnly(e.target.checked)}
+                  />
+                  Scan visible viewport only (
+                  {activeWin ? `${activeWin.viewRange.startSec.toFixed(1)}–${activeWin.viewRange.endSec.toFixed(1)}s` : ''}
+                  )
                 </label>
                 <label>
                   <input

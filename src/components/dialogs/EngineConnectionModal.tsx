@@ -67,6 +67,17 @@ export const EngineConnectionModal: React.FC = () => {
           </div>
 
           <div className="panel-btn-row" style={{ marginBottom: 8 }}>
+            <button
+              className="btn-small"
+              onClick={() =>
+                setUrlInput(
+                  (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_URL ||
+                    'https://syrinx-engine-466330924576.us-west1.run.app',
+                )
+              }
+            >
+              Cloud Run (Default)
+            </button>
             <button className="btn-small" onClick={() => setUrlInput('')}>
               Same Origin / Proxy
             </button>

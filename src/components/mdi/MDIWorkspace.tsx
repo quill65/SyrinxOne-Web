@@ -1,16 +1,17 @@
 import React, { useEffect, useRef } from 'react';
-import { X } from 'lucide-react';
+import { Database, FolderOpen, Plus, X } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/workspaceStore';
 import { MDIChildWindow } from './MDIChildWindow';
 import { SpectrogramView } from '../spectrogram/SpectrogramView';
 
-const MOBILE_TAB_HEIGHT = 36;
+const MOBILE_TAB_HEIGHT = 32;
 
 export const MDIWorkspace: React.FC = () => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const windows = useWorkspaceStore((s) => s.windows);
   const files = useWorkspaceStore((s) => s.files);
   const activeWindowId = useWorkspaceStore((s) => s.activeWindowId);
+  const activeSourceDisplayName = useWorkspaceStore((s) => s.activeSourceDisplayName);
   const canvasBounds = useWorkspaceStore((s) => s.canvasBounds);
   const setCanvasBounds = useWorkspaceStore((s) => s.setCanvasBounds);
   const focusWindow = useWorkspaceStore((s) => s.focusWindow);
@@ -18,6 +19,7 @@ export const MDIWorkspace: React.FC = () => {
   const openUploadedFile = useWorkspaceStore((s) => s.openUploadedFile);
   const importAnnotationsFromText = useWorkspaceStore((s) => s.importAnnotationsFromText);
   const setModalState = useWorkspaceStore((s) => s.setModalState);
+  const openSourceSelector = useWorkspaceStore((s) => s.openSourceSelector);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -67,18 +69,21 @@ export const MDIWorkspace: React.FC = () => {
     >
       {windows.length === 0 && (
         <div className="mdi-empty-state">
-          <h2>SyrinxOne Acoustic Workstation</h2>
-          <p>
-            Browse public ocean archives (<strong>MBARI AWS</strong>, <strong>NOAA NCEI</strong>),
-            connect <strong>Google Drive</strong>, paste a URL, or upload local audio files.
+          <h2>SyrinxOne Bioacoustics</h2>
+          <p className="mdi-empty-source-note">
+            Active Source: <strong>{activeSourceDisplayName}</strong>
           </p>
+          <div className="mdi-empty-actions">
+            <button className="btn-small" onClick={() => openSourceSelector(false)}>
+              <Database size={13} /> Select Source
+            </button>
+            <button className="btn-primary" onClick={() => setModalState('showFileBrowser', true)}>
+              <FolderOpen size={14} /> Select Recordings
+            </button>
+          </div>
           <p className="mdi-empty-hint">
-            Desktop: Drag to select · Wheel to zoom · Shift+Drag to pan · Mobile: Pinch to zoom ·
-            Toggle Select/Pan touch controls
+            Swipe left for Settings · Swipe right for AI Explorer
           </p>
-          <button className="btn-primary" onClick={() => setModalState('showFileBrowser', true)}>
-            Browse Local / Cloud Archives
-          </button>
         </div>
       )}
 
@@ -104,6 +109,13 @@ export const MDIWorkspace: React.FC = () => {
                 </button>
               </div>
             ))}
+            <button
+              className="mobile-tab-add"
+              onClick={() => setModalState('showFileBrowser', true)}
+              title="Add recordings"
+            >
+              <Plus size={13} />
+            </button>
           </div>
           <div className="mobile-spec-stage">
             <SpectrogramView

@@ -3,6 +3,7 @@ import { Link2, Maximize2, Minimize2, Minus, Play, Square, X, ZoomIn } from 'luc
 import type { AudioFileInfo, MDIWindowState } from '@syrinxone/shared';
 import { useWorkspaceStore } from '../../store/workspaceStore';
 import { audioPlayer } from '../../audio/WebAudioPlayer';
+import { formatDurationCompact } from '../../utils/spectrogramFetch';
 import { SpectrogramView } from '../spectrogram/SpectrogramView';
 
 interface Props {
@@ -95,13 +96,17 @@ export const MDIChildWindow: React.FC<Props> = ({ win, file, isActive }) => {
 
   const handlePlay = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (win.selection) {
-      const s = Math.min(win.selection.startSec, win.selection.endSec);
-      const en = Math.max(win.selection.startSec, win.selection.endSec);
-      void audioPlayer.play(engine, file.fileId, s, en);
-    } else {
-      void audioPlayer.play(engine, file.fileId, win.viewRange.startSec, win.viewRange.endSec);
-    }
+    const s = win.selection
+      ? Math.min(win.selection.startSec, win.selection.endSec)
+      : win.viewRange.startSec;
+    const en = win.selection
+      ? Math.max(win.selection.startSec, win.selection.endSec)
+      : win.viewRange.endSec;
+    void audioPlayer.play(engine, file.fileId, s, en).catch((err) => {
+      useWorkspaceStore
+        .getState()
+        .setError(err instanceof Error ? err.message : 'Unable to play audio');
+    });
   };
 
   const handleZoomToSelection = (e: React.MouseEvent) => {
@@ -137,7 +142,11 @@ export const MDIChildWindow: React.FC<Props> = ({ win, file, isActive }) => {
             {win.title}
             <span className="mdi-meta">
               {' '}
-              ({(file.sampleRate / 1000).toFixed(1)}kHz, {file.durationSec.toFixed(2)}s)
+              ({(file.sampleRate / 1000).toFixed(1)}kHz,{' '}
+              {file.isPartialWindow && file.totalDurationSec
+                ? `${formatDurationCompact(file.durationSec)} of ${formatDurationCompact(file.totalDurationSec)}`
+                : formatDurationCompact(file.durationSec)}
+              )
             </span>
           </span>
 

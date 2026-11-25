@@ -2,6 +2,14 @@ import React, { useEffect, useState } from 'react';
 import { Activity, Plus, Sparkles } from 'lucide-react';
 import type { SelectionMeasurements } from '@syrinxone/shared';
 import { useWorkspaceStore } from '../../store/workspaceStore';
+import { isCombinedFileId } from '../../utils/combinedEngine';
+import {
+  buildRecordingTimeContext,
+  formatDurationCompact,
+  formatRecordingTime,
+  isLongRecording,
+  resolveRecordingStartMs,
+} from '../../utils/timeFormat';
 
 export const MeasurementInspector: React.FC = () => {
   const engine = useWorkspaceStore((s) => s.engine);
@@ -102,7 +110,11 @@ export const MeasurementInspector: React.FC = () => {
             </div>
             <div>
               <span>Duration</span>
-              <strong>{metrics.durationSec.toFixed(3)} s</strong>
+              <strong>
+                {metrics.durationSec >= 120
+                  ? formatDurationCompact(metrics.durationSec)
+                  : `${metrics.durationSec.toFixed(3)} s`}
+              </strong>
             </div>
             <div>
               <span>Q5 / Q50 / Q95</span>
@@ -123,7 +135,21 @@ export const MeasurementInspector: React.FC = () => {
             </div>
             <div>
               <span>Time of Peak</span>
-              <strong>{metrics.timeOfPeakSec.toFixed(3)} s</strong>
+              <strong>
+                {(() => {
+                  const segs = isCombinedFileId(activeFile.fileId)
+                    ? engine.getCombinedRecording(activeFile.fileId)?.segments
+                    : undefined;
+                  const ctx = buildRecordingTimeContext(activeFile, segs);
+                  const totalDur = activeFile.totalDurationSec ?? activeFile.durationSec;
+                  const startMs = resolveRecordingStartMs(ctx);
+                  const absPeak = (activeFile.windowStartSec ?? 0) + metrics.timeOfPeakSec;
+                  if (isLongRecording(totalDur, startMs) || (activeFile.windowStartSec ?? 0) > 0) {
+                    return formatRecordingTime(absPeak, ctx, { fractionalDigits: 2 });
+                  }
+                  return `${metrics.timeOfPeakSec.toFixed(3)} s`;
+                })()}
+              </strong>
             </div>
           </div>
 

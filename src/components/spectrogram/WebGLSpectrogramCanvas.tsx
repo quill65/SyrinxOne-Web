@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import type { DisplaySettings, SpectrogramMatrix, TimeFreqRange } from '@syrinxone/shared';
+import { downsampleSpectrogramTime } from '../../utils/spectrogramFetch';
 import { buildColormapRGBA } from './colormaps';
 
 interface Props {
@@ -89,11 +90,12 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
   const uploadedMatrixRef = useRef<SpectrogramMatrix | null>(null);
   const uploadedColormapRef = useRef<string | null>(null);
 
-  const useServerBitmap = displaySettings.renderMode === 'server_bitmap';
+  const useBitmapImg =
+    displaySettings.renderMode === 'server_bitmap' && Boolean(bitmapFallbackUrl);
 
   // Initialize WebGL2 context & program once
   useEffect(() => {
-    if (useServerBitmap) return;
+    if (useBitmapImg) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
@@ -163,11 +165,11 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
       gl.deleteProgram(program);
       glResRef.current = null;
     };
-  }, [useServerBitmap]);
+  }, [useBitmapImg]);
 
   // Upload spectrogram Float32 texture & draw on any display/view change (60fps GPU)
   useEffect(() => {
-    if (useServerBitmap) return;
+    if (useBitmapImg) return;
     const res = glResRef.current;
     const canvas = canvasRef.current;
     if (!res || !canvas || !matrix || matrix.numTimeBins === 0 || matrix.numFreqBins === 0) {
@@ -185,6 +187,9 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
 
     // Upload spectrogram data only when the Float32 matrix actually changed
     if (uploadedMatrixRef.current !== matrix) {
+      const maxTex = (gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) || 4096;
+      const uploadMat =
+        matrix.numTimeBins > maxTex ? downsampleSpectrogramTime(matrix, maxTex) : matrix;
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, res.specTex);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -193,12 +198,12 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
         gl.TEXTURE_2D,
         0,
         gl.R32F,
-        matrix.numFreqBins,
-        matrix.numTimeBins,
+        uploadMat.numFreqBins,
+        uploadMat.numTimeBins,
         0,
         gl.RED,
         gl.FLOAT,
-        matrix.data,
+        uploadMat.data,
       );
       uploadedMatrixRef.current = matrix;
     }
@@ -237,9 +242,9 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
     gl.uniform1f(res.uThresh, displaySettings.thresholdDb);
     gl.uniform1f(res.uDyn, displaySettings.dynamicRangeDb);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
-  }, [matrix, viewRange, displaySettings, width, height, useServerBitmap]);
+  }, [matrix, viewRange, displaySettings, width, height, useBitmapImg]);
 
-  if (useServerBitmap && bitmapFallbackUrl) {
+  if (useBitmapImg && bitmapFallbackUrl) {
     return (
       <img
         src={bitmapFallbackUrl}

@@ -92,9 +92,33 @@ export interface AudioEngineClient {
   ): Promise<{ savedUri: string; count: number }>;
 }
 
+class EngineHttpError extends Error {
+  readonly status: number;
+  readonly body: string;
+
+  constructor(message: string, status: number, body: string) {
+    super(message);
+    this.name = 'EngineHttpError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
+interface RegisteredAudioMeta {
+  sourceId: string;
+  uri: string;
+  options?: { startSec?: number; maxDurationSec?: number };
+}
+
 export class HttpAudioEngineClient implements AudioEngineClient {
   private baseUrl: string;
   private token?: string;
+  private sourceRegistry = new Map<string, CreateSourceRequest>();
+  private fileRegistry = new Map<string, RegisteredAudioMeta>();
+  private uploadedFileRegistry = new Map<string, File>();
+  private fileIdAliases = new Map<string, string>();
+  private reopenPromises = new Map<string, Promise<string | null>>();
+  private restoreSourcePromises = new Map<string, Promise<boolean>>();
 
   constructor(config: EngineConfig) {
     this.baseUrl = config.baseUrl.replace(/\/+$/, '');
@@ -104,6 +128,102 @@ export class HttpAudioEngineClient implements AudioEngineClient {
   public setConfig(config: EngineConfig): void {
     this.baseUrl = config.baseUrl.replace(/\/+$/, '');
     this.token = config.token;
+  }
+
+  private resolveFileId(fileId: string): string {
+    let cur = fileId;
+    const seen = new Set<string>();
+    while (this.fileIdAliases.has(cur) && !seen.has(cur)) {
+      seen.add(cur);
+      cur = this.fileIdAliases.get(cur)!;
+    }
+    return cur;
+  }
+
+  private isSessionMissingError(err: unknown): boolean {
+    if (err instanceof EngineHttpError) {
+      return err.status === 404;
+    }
+    if (err instanceof Error) {
+      return /\(404\)/.test(err.message) && /not loaded in session|not found/i.test(err.message);
+    }
+    return false;
+  }
+
+  private async ensureSourceRestored(sourceId: string): Promise<boolean> {
+    const savedReq = this.sourceRegistry.get(sourceId);
+    if (!savedReq) return false;
+    const existing = this.restoreSourcePromises.get(sourceId);
+    if (existing) return existing;
+
+    const p = (async () => {
+      try {
+        await this.requestJson<DataSourceInfo>('/api/sources', {
+          method: 'POST',
+          body: JSON.stringify(savedReq),
+        });
+        return true;
+      } catch {
+        return false;
+      } finally {
+        this.restoreSourcePromises.delete(sourceId);
+      }
+    })();
+
+    this.restoreSourcePromises.set(sourceId, p);
+    return p;
+  }
+
+  private async reopenFileSession(originalFileId: string, currentFileId: string): Promise<string | null> {
+    const key = currentFileId || originalFileId;
+    const inflight = this.reopenPromises.get(key) ?? this.reopenPromises.get(originalFileId);
+    if (inflight) return inflight;
+
+    const p = (async (): Promise<string | null> => {
+      const uploadedFile =
+        this.uploadedFileRegistry.get(currentFileId) ?? this.uploadedFileRegistry.get(originalFileId);
+      if (uploadedFile) {
+        const info = await this.uploadAudio(uploadedFile);
+        this.fileIdAliases.set(originalFileId, info.fileId);
+        this.fileIdAliases.set(currentFileId, info.fileId);
+        return info.fileId;
+      }
+
+      const meta = this.fileRegistry.get(currentFileId) ?? this.fileRegistry.get(originalFileId);
+      if (!meta || meta.sourceId === 'upload' || !meta.uri) {
+        return null;
+      }
+
+      const info = await this.openAudio(meta.sourceId, meta.uri, meta.options);
+      this.fileIdAliases.set(originalFileId, info.fileId);
+      this.fileIdAliases.set(currentFileId, info.fileId);
+      return info.fileId;
+    })().finally(() => {
+      this.reopenPromises.delete(key);
+      this.reopenPromises.delete(originalFileId);
+    });
+
+    this.reopenPromises.set(key, p);
+    return p;
+  }
+
+  private async withFileSessionRetry<T>(
+    fileId: string,
+    op: (resolvedFileId: string) => Promise<T>,
+  ): Promise<T> {
+    const currentId = this.resolveFileId(fileId);
+    try {
+      return await op(currentId);
+    } catch (err) {
+      if (!this.isSessionMissingError(err)) {
+        throw err;
+      }
+      const reopenedId = await this.reopenFileSession(fileId, currentId);
+      if (!reopenedId) {
+        throw err;
+      }
+      return await op(reopenedId);
+    }
   }
 
   private headers(extra?: Record<string, string>): Record<string, string> {
@@ -126,7 +246,7 @@ export class HttpAudioEngineClient implements AudioEngineClient {
     });
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`Engine request failed (${res.status}): ${text}`);
+      throw new EngineHttpError(`Engine request failed (${res.status}): ${text}`, res.status, text);
     }
     return (await res.json()) as T;
   }
@@ -140,13 +260,16 @@ export class HttpAudioEngineClient implements AudioEngineClient {
   }
 
   async addSource(req: CreateSourceRequest): Promise<DataSourceInfo> {
-    return this.requestJson('/api/sources', {
+    const created = await this.requestJson<DataSourceInfo>('/api/sources', {
       method: 'POST',
       body: JSON.stringify(req),
     });
+    this.sourceRegistry.set(created.sourceId, { ...req, sourceId: created.sourceId });
+    return created;
   }
 
   async removeSource(sourceId: string): Promise<{ removed: string }> {
+    this.sourceRegistry.delete(sourceId);
     return this.requestJson(`/api/sources/${encodeURIComponent(sourceId)}`, {
       method: 'DELETE',
     });
@@ -154,7 +277,15 @@ export class HttpAudioEngineClient implements AudioEngineClient {
 
   async browseSource(sourceId: string, prefix = '', limit = 250): Promise<BrowseEntry[]> {
     const q = new URLSearchParams({ prefix, limit: String(limit) });
-    return this.requestJson(`/api/sources/${encodeURIComponent(sourceId)}/browse?${q.toString()}`);
+    const url = `/api/sources/${encodeURIComponent(sourceId)}/browse?${q.toString()}`;
+    try {
+      return await this.requestJson(url);
+    } catch (err) {
+      if (this.isSessionMissingError(err) && (await this.ensureSourceRestored(sourceId))) {
+        return await this.requestJson(url);
+      }
+      throw err;
+    }
   }
 
   async openAudio(
@@ -162,17 +293,32 @@ export class HttpAudioEngineClient implements AudioEngineClient {
     uri: string,
     options?: { startSec?: number; maxDurationSec?: number },
   ): Promise<AudioFileInfo> {
-    return this.requestJson('/api/audio/open', {
-      method: 'POST',
-      body: JSON.stringify({
-        sourceId,
-        uri,
-        ...(options?.startSec !== undefined ? { startSec: options.startSec } : {}),
-        ...(options?.maxDurationSec !== undefined
-          ? { maxDurationSec: options.maxDurationSec }
-          : {}),
-      }),
+    const payload = JSON.stringify({
+      sourceId,
+      uri,
+      ...(options?.startSec !== undefined ? { startSec: options.startSec } : {}),
+      ...(options?.maxDurationSec !== undefined
+        ? { maxDurationSec: options.maxDurationSec }
+        : {}),
     });
+    let info: AudioFileInfo;
+    try {
+      info = await this.requestJson<AudioFileInfo>('/api/audio/open', {
+        method: 'POST',
+        body: payload,
+      });
+    } catch (err) {
+      if (this.isSessionMissingError(err) && (await this.ensureSourceRestored(sourceId))) {
+        info = await this.requestJson<AudioFileInfo>('/api/audio/open', {
+          method: 'POST',
+          body: payload,
+        });
+      } else {
+        throw err;
+      }
+    }
+    this.fileRegistry.set(info.fileId, { sourceId, uri, options });
+    return info;
   }
 
   async openAudioUrl(
@@ -185,20 +331,24 @@ export class HttpAudioEngineClient implements AudioEngineClient {
   async uploadAudio(file: File): Promise<AudioFileInfo> {
     const form = new FormData();
     form.append('file', file);
-    return this.requestJson('/api/audio/upload', {
+    const info = await this.requestJson<AudioFileInfo>('/api/audio/upload', {
       method: 'POST',
       body: form,
     });
+    this.uploadedFileRegistry.set(info.fileId, file);
+    return info;
   }
 
   async measureSelection(
     fileId: string,
     req: MeasureSelectionRequest,
   ): Promise<SelectionMeasurements> {
-    return this.requestJson(`/api/audio/${encodeURIComponent(fileId)}/measure`, {
-      method: 'POST',
-      body: JSON.stringify(req),
-    });
+    return this.withFileSessionRetry(fileId, (fid) =>
+      this.requestJson(`/api/audio/${encodeURIComponent(fid)}/measure`, {
+        method: 'POST',
+        body: JSON.stringify(req),
+      }),
+    );
   }
 
   async analyzeWithAi(req: AiAnalyzeRequest): Promise<AiAnalyzeResponse> {
@@ -221,7 +371,12 @@ export class HttpAudioEngineClient implements AudioEngineClient {
     });
     if (startSec !== undefined) q.set('start_sec', String(startSec));
     if (endSec !== undefined) q.set('end_sec', String(endSec));
-    return this.requestJson(`/api/audio/${encodeURIComponent(fileId)}/waveform?${q.toString()}`);
+    return this.withFileSessionRetry(fileId, async (fid) => {
+      const wf = await this.requestJson<WaveformOverview>(
+        `/api/audio/${encodeURIComponent(fid)}/waveform?${q.toString()}`,
+      );
+      return { ...wf, fileId };
+    });
   }
 
   async getSpectrogram(
@@ -244,42 +399,48 @@ export class HttpAudioEngineClient implements AudioEngineClient {
     if (range?.minFreqHz !== undefined) q.set('min_freq_hz', String(range.minFreqHz));
     if (range?.maxFreqHz !== undefined) q.set('max_freq_hz', String(range.maxFreqHz));
 
-    const res = await fetch(
-      `${this.baseUrl}/api/audio/${encodeURIComponent(fileId)}/spectrogram?${q.toString()}`,
-      { headers: this.headers() },
-    );
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Spectrogram request failed (${res.status}): ${text}`);
-    }
-    const buf = await res.arrayBuffer();
-    const numTimeBins = Number(res.headers.get('X-Spec-Time-Bins') ?? '0');
-    const numFreqBins = Number(res.headers.get('X-Spec-Freq-Bins') ?? '0');
-    const timeStepSec = Number(res.headers.get('X-Spec-Time-Step') ?? '0');
-    const freqStepHz = Number(res.headers.get('X-Spec-Freq-Step') ?? '0');
-    const startSec = Number(res.headers.get('X-Spec-Start-Sec') ?? '0');
-    const endSec = Number(res.headers.get('X-Spec-End-Sec') ?? '0');
-    const minFreqHz = Number(res.headers.get('X-Spec-Min-Freq') ?? '0');
-    const maxFreqHz = Number(res.headers.get('X-Spec-Max-Freq') ?? '0');
-    const minValue = Number(res.headers.get('X-Spec-Min-Val') ?? '-120');
-    const maxValue = Number(res.headers.get('X-Spec-Max-Val') ?? '0');
+    return this.withFileSessionRetry(fileId, async (fid) => {
+      const res = await fetch(
+        `${this.baseUrl}/api/audio/${encodeURIComponent(fid)}/spectrogram?${q.toString()}`,
+        { headers: this.headers() },
+      );
+      if (!res.ok) {
+        const text = await res.text();
+        throw new EngineHttpError(
+          `Spectrogram request failed (${res.status}): ${text}`,
+          res.status,
+          text,
+        );
+      }
+      const buf = await res.arrayBuffer();
+      const numTimeBins = Number(res.headers.get('X-Spec-Time-Bins') ?? '0');
+      const numFreqBins = Number(res.headers.get('X-Spec-Freq-Bins') ?? '0');
+      const timeStepSec = Number(res.headers.get('X-Spec-Time-Step') ?? '0');
+      const freqStepHz = Number(res.headers.get('X-Spec-Freq-Step') ?? '0');
+      const startSec = Number(res.headers.get('X-Spec-Start-Sec') ?? '0');
+      const endSec = Number(res.headers.get('X-Spec-End-Sec') ?? '0');
+      const minFreqHz = Number(res.headers.get('X-Spec-Min-Freq') ?? '0');
+      const maxFreqHz = Number(res.headers.get('X-Spec-Max-Freq') ?? '0');
+      const minValue = Number(res.headers.get('X-Spec-Min-Val') ?? '-120');
+      const maxValue = Number(res.headers.get('X-Spec-Max-Val') ?? '0');
 
-    return {
-      fileId,
-      channel: params.channel,
-      numTimeBins,
-      numFreqBins,
-      timeStepSec,
-      freqStepHz,
-      startSec,
-      endSec,
-      minFreqHz,
-      maxFreqHz,
-      minValue,
-      maxValue,
-      dspMode: params.dspMode,
-      data: new Float32Array(buf),
-    };
+      return {
+        fileId,
+        channel: params.channel,
+        numTimeBins,
+        numFreqBins,
+        timeStepSec,
+        freqStepHz,
+        startSec,
+        endSec,
+        minFreqHz,
+        maxFreqHz,
+        minValue,
+        maxValue,
+        dspMode: params.dspMode,
+        data: new Float32Array(buf),
+      };
+    });
   }
 
   getSpectrogramBitmapUrl(
@@ -288,6 +449,7 @@ export class HttpAudioEngineClient implements AudioEngineClient {
     display: DisplaySettings,
     range?: { startSec?: number; endSec?: number; minFreqHz?: number; maxFreqHz?: number },
   ): string {
+    const fid = this.resolveFileId(fileId);
     const q = new URLSearchParams({
       channel: String(params.channel),
       fft_size: String(params.fftSize),
@@ -307,22 +469,26 @@ export class HttpAudioEngineClient implements AudioEngineClient {
     if (range?.minFreqHz !== undefined) q.set('min_freq_hz', String(range.minFreqHz));
     if (range?.maxFreqHz !== undefined) q.set('max_freq_hz', String(range.maxFreqHz));
     if (this.token) q.set('token', this.token);
-    return `${this.baseUrl}/api/audio/${encodeURIComponent(fileId)}/spectrogram.png?${q.toString()}`;
+    return `${this.baseUrl}/api/audio/${encodeURIComponent(fid)}/spectrogram.png?${q.toString()}`;
   }
 
   getAudioStreamUrl(fileId: string): string {
+    const fid = this.resolveFileId(fileId);
     const q = this.token ? `?token=${encodeURIComponent(this.token)}` : '';
-    return `${this.baseUrl}/api/audio/${encodeURIComponent(fileId)}/stream${q}`;
+    return `${this.baseUrl}/api/audio/${encodeURIComponent(fid)}/stream${q}`;
   }
 
   async fetchAudioArrayBuffer(fileId: string): Promise<ArrayBuffer> {
-    const res = await fetch(`${this.baseUrl}/api/audio/${encodeURIComponent(fileId)}/stream`, {
-      headers: this.headers(),
+    return this.withFileSessionRetry(fileId, async (fid) => {
+      const res = await fetch(`${this.baseUrl}/api/audio/${encodeURIComponent(fid)}/stream`, {
+        headers: this.headers(),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new EngineHttpError(`Audio stream fetch failed (${res.status}): ${text}`, res.status, text);
+      }
+      return res.arrayBuffer();
     });
-    if (!res.ok) {
-      throw new Error(`Audio stream fetch failed (${res.status})`);
-    }
-    return res.arrayBuffer();
   }
 
   async exportSpectrogramTsv(
@@ -342,28 +508,46 @@ export class HttpAudioEngineClient implements AudioEngineClient {
     if (range?.endSec !== undefined) q.set('end_sec', String(range.endSec));
     if (range?.minFreqHz !== undefined) q.set('min_freq_hz', String(range.minFreqHz));
     if (range?.maxFreqHz !== undefined) q.set('max_freq_hz', String(range.maxFreqHz));
-    const res = await fetch(
-      `${this.baseUrl}/api/audio/${encodeURIComponent(fileId)}/spectrogram.tsv?${q.toString()}`,
-      { headers: this.headers() },
-    );
-    if (!res.ok) {
-      throw new Error(`Spectrogram TSV export failed (${res.status})`);
-    }
-    return res.text();
+    return this.withFileSessionRetry(fileId, async (fid) => {
+      const res = await fetch(
+        `${this.baseUrl}/api/audio/${encodeURIComponent(fid)}/spectrogram.tsv?${q.toString()}`,
+        { headers: this.headers() },
+      );
+      if (!res.ok) {
+        const text = await res.text();
+        throw new EngineHttpError(
+          `Spectrogram TSV export failed (${res.status}): ${text}`,
+          res.status,
+          text,
+        );
+      }
+      return res.text();
+    });
   }
 
   async detectSounds(fileId: string, req: DetectSoundsRequest): Promise<DetectSoundsResponse> {
-    return this.requestJson(`/api/audio/${encodeURIComponent(fileId)}/detect`, {
-      method: 'POST',
-      body: JSON.stringify(req),
-    });
+    return this.withFileSessionRetry(fileId, (fid) =>
+      this.requestJson(`/api/audio/${encodeURIComponent(fid)}/detect`, {
+        method: 'POST',
+        body: JSON.stringify(req),
+      }),
+    );
   }
 
   async clipAndSave(req: ClipSaveRequest): Promise<ClipSaveResponse> {
-    return this.requestJson('/api/audio/clip-save', {
-      method: 'POST',
-      body: JSON.stringify(req),
-    });
+    const resp = await this.withFileSessionRetry(req.fileId, (fid) =>
+      this.requestJson<ClipSaveResponse>('/api/audio/clip-save', {
+        method: 'POST',
+        body: JSON.stringify({ ...req, fileId: fid }),
+      }),
+    );
+    if (resp.fileInfo) {
+      this.fileRegistry.set(resp.fileInfo.fileId, {
+        sourceId: resp.fileInfo.sourceId,
+        uri: resp.fileInfo.uri,
+      });
+    }
+    return resp;
   }
 
   async importAnnotationsText(
