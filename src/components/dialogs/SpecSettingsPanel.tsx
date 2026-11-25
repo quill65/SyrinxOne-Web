@@ -7,6 +7,7 @@ import { MeasurementInspector } from '../panels/MeasurementInspector';
 export const SpecSettingsPanel: React.FC = () => {
   const windows = useWorkspaceStore((s) => s.windows);
   const activeWindowId = useWorkspaceStore((s) => s.activeWindowId);
+  const files = useWorkspaceStore((s) => s.files);
   const updateWindowDisplaySettings = useWorkspaceStore((s) => s.updateWindowDisplaySettings);
   const updateWindowSpecParams = useWorkspaceStore((s) => s.updateWindowSpecParams);
   const applySettingsToAllWindows = useWorkspaceStore((s) => s.applySettingsToAllWindows);
@@ -17,6 +18,7 @@ export const SpecSettingsPanel: React.FC = () => {
   const setModalState = useWorkspaceStore((s) => s.setModalState);
 
   const activeWin = windows.find((w) => w.windowId === activeWindowId);
+  const activeFile = activeWin ? files[activeWin.fileId] : undefined;
   if (!activeWin) {
     return (
       <aside className="side-panel">
@@ -307,6 +309,97 @@ export const SpecSettingsPanel: React.FC = () => {
             />
           </div>
         )}
+
+        <hr className="panel-divider" />
+
+        <div className="field-group">
+          <label>
+            Split Time Rows <span>{disp.splitTimeRows ?? 1} / 10</span>
+          </label>
+          <div className="field-inline-row">
+            <button
+              type="button"
+              className="btn-small"
+              disabled={(disp.splitTimeRows ?? 1) <= 1}
+              onClick={() =>
+                updateWindowDisplaySettings(activeWin.windowId, {
+                  splitTimeRows: Math.max(1, (disp.splitTimeRows ?? 1) - 1),
+                })
+              }
+              title="Decrease contiguous time rows"
+            >
+              −
+            </button>
+            <select
+              value={disp.splitTimeRows ?? 1}
+              onChange={(e) =>
+                updateWindowDisplaySettings(activeWin.windowId, {
+                  splitTimeRows: Number(e.target.value),
+                })
+              }
+              title="Split spectrogram into up to 10 contiguous time rows"
+            >
+              {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
+                <option key={n} value={n}>
+                  {n === 1 ? '1 Row (Single View)' : `${n} Contiguous Time Rows`}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="btn-small"
+              disabled={(disp.splitTimeRows ?? 1) >= 10}
+              onClick={() =>
+                updateWindowDisplaySettings(activeWin.windowId, {
+                  splitTimeRows: Math.min(10, (disp.splitTimeRows ?? 1) + 1),
+                })
+              }
+              title="Increase contiguous time rows"
+            >
+              +
+            </button>
+          </div>
+        </div>
+
+        <div className="field-group">
+          <label>
+            Channel Display{' '}
+            <span>{activeFile && activeFile.numChannels > 1 ? `${activeFile.numChannels} ch` : 'Mono'}</span>
+          </label>
+          <select
+            disabled={!activeFile || activeFile.numChannels <= 1}
+            value={
+              activeFile && activeFile.numChannels > 1 && disp.stackAllChannels
+                ? -1
+                : spec.channel
+            }
+            onChange={(e) => {
+              const val = Number(e.target.value);
+              if (val === -1) {
+                updateWindowDisplaySettings(activeWin.windowId, { stackAllChannels: true });
+              } else {
+                if (disp.stackAllChannels) {
+                  updateWindowDisplaySettings(activeWin.windowId, { stackAllChannels: false });
+                }
+                void updateWindowSpecParams(activeWin.windowId, { channel: val });
+              }
+            }}
+            title="Select single channel or stack all channels as separate rows"
+          >
+            {activeFile && activeFile.numChannels > 1 ? (
+              <>
+                <option value={-1}>Stack All {activeFile.numChannels} Channels</option>
+                {Array.from({ length: activeFile.numChannels }, (_, idx) => (
+                  <option key={idx} value={idx}>
+                    Channel {idx + 1} only
+                  </option>
+                ))}
+              </>
+            ) : (
+              <option value={0}>Channel 1 (Mono recording)</option>
+            )}
+          </select>
+        </div>
 
         <hr className="panel-divider" />
 

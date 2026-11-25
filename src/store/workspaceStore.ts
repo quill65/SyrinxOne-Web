@@ -170,6 +170,16 @@ function loadSavedHotkeys(): HotkeyBinding[] {
   return DEFAULT_HOTKEY_BINDINGS;
 }
 
+function sanitizeDisplaySettings(raw?: Partial<DisplaySettings>): DisplaySettings {
+  const merged = { ...DEFAULT_DISPLAY_SETTINGS, ...(raw ?? {}) };
+  const rawRows = Number(merged.splitTimeRows);
+  return {
+    ...merged,
+    splitTimeRows: Number.isFinite(rawRows) ? Math.max(1, Math.min(10, Math.round(rawRows))) : 1,
+    stackAllChannels: Boolean(merged.stackAllChannels),
+  };
+}
+
 function loadSavedDefaults(): {
   specParams: SpectrogramParams;
   displaySettings: DisplaySettings;
@@ -186,7 +196,7 @@ function loadSavedDefaults(): {
       const autoGainMode = normalizeAutoGainMode(parsed.autoGainMode);
       return {
         specParams: { ...DEFAULT_SPECTROGRAM_PARAMS, ...(parsed.specParams ?? {}) },
-        displaySettings: { ...DEFAULT_DISPLAY_SETTINGS, ...(parsed.displaySettings ?? {}) },
+        displaySettings: sanitizeDisplaySettings(parsed.displaySettings),
         autoGainMode,
       };
     }
@@ -904,11 +914,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     const height = Math.min(440, Math.max(300, state.canvasBounds.height - 80));
 
     const saved = meta?.restoreState ?? null;
-    const disp: DisplaySettings = {
+    const disp: DisplaySettings = sanitizeDisplaySettings({
       ...state.defaultDisplaySettings,
       ...(saved?.displaySettings ?? {}),
       lockSettings: false,
-    };
+    });
     const spec: SpectrogramParams = {
       ...state.defaultSpecParams,
       ...(saved?.specParams ?? {}),
@@ -1035,29 +1045,62 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     if (!win) return;
     const file = state.files[win.fileId];
     if (!file) return;
-    const key = makeSpecCacheKey(win.fileId, win.specParams);
-    const cached = state.spectrogramCache[key];
-    if (cached) {
+
+    const targetChannels =
+      win.displaySettings.stackAllChannels && file.numChannels > 1
+        ? Array.from({ length: file.numChannels }, (_, idx) => idx)
+        : [win.specParams.channel];
+
+    let primaryMatrix: SpectrogramMatrix | undefined;
+    const missing: number[] = [];
+    for (const ch of targetChannels) {
+      const chParams = { ...win.specParams, channel: ch };
+      const key = makeSpecCacheKey(win.fileId, chParams);
+      const cached = state.spectrogramCache[key];
+      if (cached) {
+        if (ch === win.specParams.channel || !primaryMatrix) primaryMatrix = cached;
+      } else {
+        missing.push(ch);
+      }
+    }
+
+    if (missing.length === 0) {
       const mode = normalizeAutoGainMode(state.windowAutoGainMode[windowId]);
-      if (mode === 'auto') {
+      if (mode === 'auto' && primaryMatrix) {
         get().normalizeWindowGain(windowId, {
           scope: 'view',
-          matrix: cached,
+          matrix: primaryMatrix,
           silent: true,
         });
       }
       return;
     }
+
     try {
-      const mat = await fetchSpectrogramAdaptive(state.engine, file, win.specParams);
-      set((s) => ({
-        spectrogramCache: { ...s.spectrogramCache, [key]: mat },
-      }));
+      const fetched = await Promise.all(
+        missing.map(async (ch) => {
+          const chParams = { ...win.specParams, channel: ch };
+          const key = makeSpecCacheKey(win.fileId, chParams);
+          const mat = await fetchSpectrogramAdaptive(state.engine, file, chParams);
+          return { ch, key, mat };
+        }),
+      );
+      set((s) => {
+        const nextCache = { ...s.spectrogramCache };
+        for (const item of fetched) {
+          nextCache[item.key] = item.mat;
+        }
+        return { spectrogramCache: nextCache };
+      });
+      const normMat =
+        fetched.find((f) => f.ch === win.specParams.channel)?.mat ??
+        primaryMatrix ??
+        fetched[0]?.mat;
       const mode = normalizeAutoGainMode(get().windowAutoGainMode[windowId]);
-      if (mode === 'auto') {
+      if (mode === 'auto' && normMat) {
         get().normalizeWindowGain(windowId, {
           scope: 'view',
-          matrix: mat,
+          matrix: normMat,
           silent: true,
         });
       }
@@ -1070,13 +1113,28 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     const state = get();
     const win = state.windows.find((w) => w.windowId === windowId);
     if (!win) return;
-    const key = `${win.fileId}|${win.specParams.channel}`;
-    if (state.waveformCache[key]) return;
+    const file = state.files[win.fileId];
+    const targetChannels =
+      win.displaySettings.stackAllChannels && file && file.numChannels > 1
+        ? Array.from({ length: file.numChannels }, (_, idx) => idx)
+        : [win.specParams.channel];
+    const missing = targetChannels.filter((ch) => !state.waveformCache[`${win.fileId}|${ch}`]);
+    if (missing.length === 0) return;
+
     try {
-      const wf = await state.engine.getWaveform(win.fileId, win.specParams.channel, 2000);
-      set((s) => ({
-        waveformCache: { ...s.waveformCache, [key]: wf },
-      }));
+      const fetched = await Promise.all(
+        missing.map(async (ch) => ({
+          key: `${win.fileId}|${ch}`,
+          wf: await state.engine.getWaveform(win.fileId, ch, 2000),
+        })),
+      );
+      set((s) => {
+        const nextCache = { ...s.waveformCache };
+        for (const item of fetched) {
+          nextCache[item.key] = item.wf;
+        }
+        return { waveformCache: nextCache };
+      });
     } catch (err) {
       set({ errorMessage: err instanceof Error ? err.message : 'Waveform fetch failed' });
     }
@@ -1261,6 +1319,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
       patch.gainDb !== undefined ||
       patch.thresholdDb !== undefined ||
       patch.dynamicRangeDb !== undefined;
+    const cleanPatch = { ...patch };
+    if (cleanPatch.splitTimeRows !== undefined) {
+      cleanPatch.splitTimeRows = Math.max(1, Math.min(10, Math.round(cleanPatch.splitTimeRows)));
+    }
     set((s) => {
       const nextModes = manualLevelEdit
         ? { ...s.windowAutoGainMode, [windowId]: 'manual' as AutoGainMode }
@@ -1269,12 +1331,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
         windowAutoGainMode: nextModes,
         windows: s.windows.map((w) => {
           if (w.windowId !== windowId) return w;
-          const nextDisp = { ...w.displaySettings, ...patch };
+          const nextDisp = sanitizeDisplaySettings({ ...w.displaySettings, ...cleanPatch });
           let nextRange = w.viewRange;
           const file = s.files[w.fileId];
           if (
             file &&
-            (patch.timeScaleMode !== undefined || patch.msPerPixel !== undefined)
+            (cleanPatch.timeScaleMode !== undefined || cleanPatch.msPerPixel !== undefined)
           ) {
             if (nextDisp.timeScaleMode === 'stretch') {
               nextRange = { ...w.viewRange, startSec: 0, endSec: file.durationSec };
@@ -1293,6 +1355,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
         }),
       };
     });
+    if (cleanPatch.stackAllChannels) {
+      void Promise.all([get().ensureSpectrogram(windowId), get().ensureWaveform(windowId)]);
+    }
     schedulePersistView(get, windowId);
   },
 
@@ -1414,7 +1479,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
       };
     });
 
-    await Promise.all(targetIds.map((id) => get().ensureSpectrogram(id)));
+    await Promise.all(
+      targetIds.flatMap((id) => [get().ensureSpectrogram(id), get().ensureWaveform(id)]),
+    );
   },
 
   makeActiveSettingsDefault: (sourceWindowId) => {
@@ -1570,7 +1637,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
             linkGroupId: savedWin.linkGroupId ?? null,
             viewRange: savedWin.viewRange,
             specParams: { ...DEFAULT_SPECTROGRAM_PARAMS, ...savedWin.specParams },
-            displaySettings: { ...DEFAULT_DISPLAY_SETTINGS, ...savedWin.displaySettings },
+            displaySettings: sanitizeDisplaySettings(savedWin.displaySettings),
             selection: null,
           };
           set((s) => ({

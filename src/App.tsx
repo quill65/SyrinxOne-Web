@@ -223,12 +223,27 @@ export const App: React.FC = () => {
     const file = state.files[win.fileId];
     const mat = getCachedSpectrogram(state.spectrogramCache, win.fileId, win.specParams);
     if (!file || !mat) return;
+    const stackChannels = Boolean(win.displaySettings.stackAllChannels) && file.numChannels > 1;
+    const channels = stackChannels
+      ? Array.from({ length: file.numChannels }, (_, i) => i)
+      : [win.specParams.channel];
+    const byCh: Record<number, typeof mat | undefined> = {};
+    for (const ch of channels) {
+      byCh[ch] = getCachedSpectrogram(state.spectrogramCache, win.fileId, {
+        ...win.specParams,
+        channel: ch,
+      });
+    }
     try {
       const mode = await copySpectrogramImageToClipboard(
         mat,
         win.viewRange,
         win.displaySettings,
         file.name,
+        1000,
+        460,
+        byCh,
+        channels,
       );
       setStatus(
         mode === 'clipboard'

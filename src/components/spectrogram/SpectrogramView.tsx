@@ -14,11 +14,15 @@ import { fetchSpectrogramAdaptive } from '../../utils/spectrogramFetch';
 import {
   buildRecordingTimeContext,
   formatAxisTickTime,
+  formatRecordingRange,
   isLongRecording,
   resolveRecordingStartMs,
 } from '../../utils/timeFormat';
 import { WaveformCanvas } from './WaveformCanvas';
-import { WebGLSpectrogramCanvas } from './WebGLSpectrogramCanvas';
+import {
+  WebGLSpectrogramCanvas,
+  type SpectrogramRenderRow,
+} from './WebGLSpectrogramCanvas';
 
 interface Props {
   win: MDIWindowState;
@@ -29,8 +33,10 @@ interface Props {
 
 const AXIS_LEFT = 54;
 const AXIS_BOTTOM = 26;
+const COMPACT_AXIS_BOTTOM = 18;
 const SCROLLBAR_HEIGHT = 12;
 const WAVEFORM_HEIGHT = 54;
+const ROW_GAP = 4;
 const HANDLE_RADIUS = 6;
 
 type HandleId = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
@@ -39,6 +45,24 @@ interface ContextMenuState {
   x: number;
   y: number;
   annotation: AnnotationRecord | null;
+}
+
+interface RowLayout {
+  rowIndex: number;
+  timeRowIndex: number;
+  channel: number;
+  startSec: number;
+  endSec: number;
+  minFreqHz: number;
+  maxFreqHz: number;
+  rowTop: number;
+  waveTop: number;
+  waveH: number;
+  plotTop: number;
+  plotH: number;
+  axisBottomH: number;
+  rowBottom: number;
+  badgeText: string;
 }
 
 function computeNiceTicks(min: number, max: number, approxCount: number): number[] {
@@ -133,7 +157,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
   const [cursorStyle, setCursorStyle] = useState<string>('crosshair');
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [touchMode, setTouchMode] = useState<'select' | 'pan'>('select');
-  const [zoomMatrix, setZoomMatrix] = useState<SpectrogramMatrix | null>(null);
+  const [zoomMatrices, setZoomMatrices] = useState<Record<number, SpectrogramMatrix>>({});
 
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
   const lastTapRef = useRef<number>(0);
@@ -143,17 +167,26 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     midX: number;
     midY: number;
     origRange: MDIWindowState['viewRange'];
+    rowSpanT: number;
   } | null>(null);
   const dragModeRef = useRef<
-    | { kind: 'select'; startT: number; startF: number }
-    | { kind: 'pan'; startX: number; startY: number; origRange: MDIWindowState['viewRange'] }
+    | { kind: 'select'; anchorRowIndex: number; channel: number; startT: number; startF: number }
+    | {
+        kind: 'pan';
+        anchorRowIndex: number;
+        startX: number;
+        startY: number;
+        origRange: MDIWindowState['viewRange'];
+      }
     | {
         kind: 'resize_sel';
+        anchorRowIndex: number;
         handle: HandleId;
         orig: SelectionBox;
       }
     | {
         kind: 'resize_ann';
+        anchorRowIndex: number;
         annId: string;
         handle: HandleId;
         orig: { startSec: number; endSec: number; lowFreqHz: number; highFreqHz: number };
@@ -171,45 +204,74 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     return () => window.removeEventListener('click', close);
   }, [contextMenu]);
 
-  const matrix = getCachedSpectrogram(specCache, file.fileId, win.specParams);
-  const waveform = waveformCache[`${file.fileId}|${win.specParams.channel}`];
+  const splitTimeRows = Math.max(1, Math.min(10, Math.round(win.displaySettings.splitTimeRows ?? 1)));
+  const stackChannels = Boolean(win.displaySettings.stackAllChannels) && file.numChannels > 1;
+  const displayedChannels = useMemo(
+    () =>
+      stackChannels
+        ? Array.from({ length: file.numChannels }, (_, idx) => idx)
+        : [win.specParams.channel],
+    [stackChannels, file.numChannels, win.specParams.channel],
+  );
+  const totalRows = splitTimeRows * displayedChannels.length;
+
+  const primaryOverviewMatrix = getCachedSpectrogram(specCache, file.fileId, win.specParams);
 
   const spanT = Math.max(1e-6, win.viewRange.endSec - win.viewRange.startSec);
   const needsScrollbar =
     win.displaySettings.timeScaleMode === 'fixed' || spanT < file.durationSec - 0.005;
 
   useEffect(() => {
-    setZoomMatrix(null);
+    setZoomMatrices({});
   }, [
     file.fileId,
     file.windowStartSec,
     file.durationSec,
-    win.specParams.channel,
     win.specParams.fftSize,
     win.specParams.hopSize,
     win.specParams.dspMode,
+    win.specParams.windowType,
+    win.specParams.popFilter,
   ]);
 
-  // Automatically fetch high-resolution STFT slice when zooming into a downsampled multi-hour spectrogram
+  // Automatically fetch high-resolution STFT slice(s) when zooming into a downsampled recording
   useEffect(() => {
-    if (!matrix || win.displaySettings.renderMode === 'server_bitmap') {
-      setZoomMatrix(null);
+    if (win.displaySettings.renderMode === 'server_bitmap') {
+      setZoomMatrices({});
       return;
     }
-    const nativeStep = Math.min(win.specParams.hopSize, win.specParams.fftSize) / Math.max(1, file.sampleRate);
-    const isDownsampledOverview = matrix.timeStepSec > nativeStep * 1.5;
-    if (!isDownsampledOverview || spanT >= file.durationSec * 0.45) {
-      setZoomMatrix(null);
-      return;
+
+    const nativeStep =
+      Math.min(win.specParams.hopSize, win.specParams.fftSize) / Math.max(1, file.sampleRate);
+
+    const channelsNeedingZoom: number[] = [];
+    for (const ch of displayedChannels) {
+      const ovMat = getCachedSpectrogram(specCache, file.fileId, {
+        ...win.specParams,
+        channel: ch,
+      });
+      if (!ovMat) continue;
+      const isDownsampledOverview = ovMat.timeStepSec > nativeStep * 1.5;
+      if (!isDownsampledOverview || spanT >= file.durationSec * 0.45) continue;
+
+      const existing = zoomMatrices[ch];
+      if (
+        existing &&
+        existing.fileId === file.fileId &&
+        existing.channel === ch &&
+        existing.startSec <= win.viewRange.startSec + 0.01 &&
+        existing.endSec >= win.viewRange.endSec - 0.01 &&
+        existing.endSec - existing.startSec <= spanT * 2.5
+      ) {
+        continue;
+      }
+      channelsNeedingZoom.push(ch);
     }
-    if (
-      zoomMatrix &&
-      zoomMatrix.fileId === file.fileId &&
-      zoomMatrix.channel === win.specParams.channel &&
-      zoomMatrix.startSec <= win.viewRange.startSec + 0.01 &&
-      zoomMatrix.endSec >= win.viewRange.endSec - 0.01 &&
-      zoomMatrix.endSec - zoomMatrix.startSec <= spanT * 2.5
-    ) {
+
+    if (channelsNeedingZoom.length === 0) {
+      if (spanT >= file.durationSec * 0.45 && Object.keys(zoomMatrices).length > 0) {
+        setZoomMatrices({});
+      }
       return;
     }
 
@@ -218,12 +280,26 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
       const pad = spanT * 0.25;
       const reqStart = Math.max(0, win.viewRange.startSec - pad);
       const reqEnd = Math.min(file.durationSec, win.viewRange.endSec + pad);
-      void fetchSpectrogramAdaptive(engine, file, win.specParams, {
-        startSec: reqStart,
-        endSec: reqEnd,
-      })
-        .then((hiRes) => {
-          if (!cancelled) setZoomMatrix(hiRes);
+      void Promise.all(
+        channelsNeedingZoom.map(async (ch) => {
+          const hiRes = await fetchSpectrogramAdaptive(
+            engine,
+            file,
+            { ...win.specParams, channel: ch },
+            { startSec: reqStart, endSec: reqEnd },
+          );
+          return { ch, hiRes };
+        }),
+      )
+        .then((items) => {
+          if (cancelled) return;
+          setZoomMatrices((prev) => {
+            const next = { ...prev };
+            for (const item of items) {
+              next[item.ch] = item.hiRes;
+            }
+            return next;
+          });
         })
         .catch(() => {
           // keep overview matrix cleanly if zoom fetch fails
@@ -237,35 +313,60 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
   }, [
     engine,
     file,
-    matrix,
+    specCache,
+    displayedChannels,
     win.specParams,
     win.viewRange.startSec,
     win.viewRange.endSec,
     win.displaySettings.renderMode,
     spanT,
-    zoomMatrix,
+    zoomMatrices,
   ]);
 
-  const activeRenderMatrix =
-    zoomMatrix &&
-    zoomMatrix.fileId === file.fileId &&
-    zoomMatrix.channel === win.specParams.channel &&
-    zoomMatrix.startSec <= win.viewRange.startSec + 0.05 &&
-    zoomMatrix.endSec >= win.viewRange.endSec - 0.05
-      ? zoomMatrix
-      : matrix;
+  const activeMatricesByChannel = useMemo(() => {
+    const out: Record<number, SpectrogramMatrix | undefined> = {};
+    for (const ch of displayedChannels) {
+      const zm = zoomMatrices[ch];
+      const ov = getCachedSpectrogram(specCache, file.fileId, {
+        ...win.specParams,
+        channel: ch,
+      });
+      out[ch] =
+        zm &&
+        zm.fileId === file.fileId &&
+        zm.channel === ch &&
+        zm.startSec <= win.viewRange.startSec + 0.05 &&
+        zm.endSec >= win.viewRange.endSec - 0.05
+          ? zm
+          : ov;
+    }
+    return out;
+  }, [
+    displayedChannels,
+    zoomMatrices,
+    specCache,
+    file.fileId,
+    win.specParams,
+    win.viewRange.startSec,
+    win.viewRange.endSec,
+  ]);
+
+  const primaryRenderMatrix =
+    activeMatricesByChannel[win.specParams.channel] ??
+    activeMatricesByChannel[displayedChannels[0]] ??
+    primaryOverviewMatrix;
 
   // Keep contrast normalized to visible viewport when Auto-normalize is enabled
   useEffect(() => {
-    if (autoGainMode !== 'auto' || !activeRenderMatrix) return;
+    if (autoGainMode !== 'auto' || !primaryRenderMatrix) return;
     normalizeWindowGain(win.windowId, {
       scope: 'view',
-      matrix: activeRenderMatrix,
+      matrix: primaryRenderMatrix,
       silent: true,
     });
   }, [
     autoGainMode,
-    activeRenderMatrix,
+    primaryRenderMatrix,
     normalizeWindowGain,
     win.windowId,
     win.viewRange.startSec,
@@ -274,14 +375,123 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     win.viewRange.maxFreqHz,
   ]);
 
+  const timeCtx = useMemo(() => {
+    const combinedSegs = isCombinedFileId(file.fileId)
+      ? engine.getCombinedRecording(file.fileId)?.segments
+      : undefined;
+    return buildRecordingTimeContext(file, combinedSegs);
+  }, [file, engine]);
+
   const showAxes = win.displaySettings.showAxes;
   const showWave = win.displaySettings.showWaveform;
   const leftPad = showAxes ? AXIS_LEFT : 0;
   const scrollH = needsScrollbar ? SCROLLBAR_HEIGHT : 0;
-  const bottomPad = (showAxes ? AXIS_BOTTOM : 0) + scrollH;
-  const waveH = showWave ? WAVEFORM_HEIGHT : 0;
-  const plotW = Math.max(40, width - leftPad);
-  const plotH = Math.max(40, height - bottomPad - waveH);
+  const viewportH = Math.max(60, height - scrollH);
+
+  // Compute single or stacked row layout geometry
+  const { rows, stageW, stageH, plotW, isVertScrollable } = useMemo(() => {
+    const isMulti = totalRows > 1;
+    const perRowWaveH = showWave
+      ? isMulti
+        ? totalRows <= 4
+          ? 26
+          : 18
+        : WAVEFORM_HEIGHT
+      : 0;
+    const perRowAxisBottomH = showAxes ? (isMulti ? COMPACT_AXIS_BOTTOM : AXIS_BOTTOM) : 0;
+    const gap = isMulti ? ROW_GAP : 0;
+
+    let perRowPlotH: number;
+    let totalStageH: number;
+    if (!isMulti) {
+      perRowPlotH = Math.max(40, viewportH - perRowWaveH - perRowAxisBottomH);
+      totalStageH = viewportH;
+    } else {
+      const minPlotH = totalRows <= 3 ? 88 : 74;
+      const overhead = totalRows * (perRowWaveH + perRowAxisBottomH) + (totalRows - 1) * gap;
+      const fitPlotH = Math.floor((viewportH - overhead) / totalRows);
+      perRowPlotH = Math.max(minPlotH, fitPlotH);
+      totalStageH = Math.max(viewportH, totalRows * (perRowWaveH + perRowPlotH + perRowAxisBottomH) + (totalRows - 1) * gap);
+    }
+
+    const vertScroll = totalStageH > viewportH + 1;
+    const effectiveStageW = Math.max(80, vertScroll ? width - 10 : width);
+    const effectivePlotW = Math.max(40, effectiveStageW - leftPad);
+
+    const { startSec, minFreqHz, maxFreqHz } = win.viewRange;
+    const windowOffsetSec = file.windowStartSec ?? 0;
+    const totalDur = file.totalDurationSec ?? file.durationSec;
+
+    const list: RowLayout[] = [];
+    let cursorY = 0;
+
+    for (let r = 0; r < splitTimeRows; r++) {
+      const rStart = startSec + (r / splitTimeRows) * spanT;
+      const rEnd = startSec + ((r + 1) / splitTimeRows) * spanT;
+      const rangeFmt =
+        splitTimeRows > 1
+          ? formatRecordingRange(windowOffsetSec + rStart, windowOffsetSec + rEnd, totalDur, timeCtx)
+          : null;
+
+      for (const ch of displayedChannels) {
+        const idx = list.length;
+        const rowTop = cursorY;
+        const waveTop = rowTop;
+        const plotTop = rowTop + perRowWaveH;
+        const rowBottom = plotTop + perRowPlotH + perRowAxisBottomH;
+
+        const parts: string[] = [];
+        if (stackChannels) parts.push(`Ch ${ch + 1}`);
+        if (splitTimeRows > 1 && rangeFmt) {
+          parts.push(`#${r + 1}/${splitTimeRows} · ${rangeFmt.startLabel}–${rangeFmt.endLabel}`);
+        }
+
+        list.push({
+          rowIndex: idx,
+          timeRowIndex: r,
+          channel: ch,
+          startSec: rStart,
+          endSec: rEnd,
+          minFreqHz,
+          maxFreqHz,
+          rowTop,
+          waveTop,
+          waveH: perRowWaveH,
+          plotTop,
+          plotH: perRowPlotH,
+          axisBottomH: perRowAxisBottomH,
+          rowBottom,
+          badgeText: parts.join(' · '),
+        });
+
+        cursorY = rowBottom + gap;
+      }
+    }
+
+    return {
+      rows: list,
+      stageW: effectiveStageW,
+      stageH: totalStageH,
+      plotW: effectivePlotW,
+      isVertScrollable: vertScroll,
+    };
+  }, [
+    totalRows,
+    showWave,
+    showAxes,
+    viewportH,
+    width,
+    leftPad,
+    win.viewRange,
+    spanT,
+    splitTimeRows,
+    displayedChannels,
+    stackChannels,
+    file.windowStartSec,
+    file.totalDurationSec,
+    file.durationSec,
+    timeCtx,
+  ]);
 
   const visibleAnnotations = useMemo(() => {
     const fname = file.name.toLowerCase();
@@ -305,143 +515,211 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     });
   }, [annotations, file.name, annotationFilter]);
 
-  const bitmapFallbackUrl = useMemo(() => {
-    if (win.displaySettings.renderMode !== 'server_bitmap') return undefined;
-    return engine.getSpectrogramBitmapUrl(
-      file.fileId,
-      win.specParams,
-      win.displaySettings,
-      win.viewRange,
-    );
-  }, [engine, file.fileId, win.specParams, win.displaySettings, win.viewRange]);
+  const webglRows: SpectrogramRenderRow[] = useMemo(() => {
+    return rows.map((row) => {
+      const mat = activeMatricesByChannel[row.channel];
+      const rowView = {
+        startSec: row.startSec,
+        endSec: row.endSec,
+        minFreqHz: row.minFreqHz,
+        maxFreqHz: row.maxFreqHz,
+      };
+      const bitmapFallbackUrl =
+        win.displaySettings.renderMode === 'server_bitmap'
+          ? engine.getSpectrogramBitmapUrl(
+              file.fileId,
+              { ...win.specParams, channel: row.channel },
+              win.displaySettings,
+              rowView,
+            )
+          : undefined;
+      return {
+        key: `${row.rowIndex}-${row.channel}-${row.timeRowIndex}`,
+        matrix: mat,
+        viewRange: rowView,
+        topPx: row.plotTop,
+        heightPx: row.plotH,
+        bitmapFallbackUrl,
+      };
+    });
+  }, [rows, activeMatricesByChannel, win.displaySettings, win.specParams, engine, file.fileId]);
 
   const playheadSec =
     playback.isPlaying && playback.fileId === file.fileId ? playback.currentTimeSec : null;
 
   const { startSec, endSec, minFreqHz, maxFreqHz } = win.viewRange;
   const spanF = Math.max(1e-6, maxFreqHz - minFreqHz);
-  const timeToX = (t: number) => leftPad + ((t - startSec) / spanT) * plotW;
-  const freqToY = (f: number) => waveH + (1 - (f - minFreqHz) / spanF) * plotH;
 
-  // Draw overlay: axes, grid, annotations + handles, selection box + handles, playhead
+  const rowTimeToX = (row: RowLayout, t: number) =>
+    leftPad + ((t - row.startSec) / Math.max(1e-6, row.endSec - row.startSec)) * plotW;
+
+  const rowFreqToY = (row: RowLayout, f: number) =>
+    row.plotTop + (1 - (f - row.minFreqHz) / Math.max(1e-6, row.maxFreqHz - row.minFreqHz)) * row.plotH;
+
+  // Draw overlay: per-row axes, grid, annotations + handles, selection box + handles, playhead, row badges
   useEffect(() => {
     const canvas = overlayRef.current;
-    if (!canvas || width <= 0 || height <= 0) return;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.round(width * dpr);
-    canvas.height = Math.round(height * dpr);
+    if (!canvas || stageW <= 0 || stageH <= 0) return;
+
+    const baseDpr = window.devicePixelRatio || 1;
+    const effDpr = Math.min(baseDpr, 4096 / Math.max(1, stageH), 4096 / Math.max(1, stageW));
+    const pxW = Math.max(1, Math.round(stageW * effDpr));
+    const pxH = Math.max(1, Math.round(stageH * effDpr));
+    if (canvas.width !== pxW || canvas.height !== pxH) {
+      canvas.width = pxW;
+      canvas.height = pxH;
+    }
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, width, height);
+    ctx.setTransform(pxW / stageW, 0, 0, pxH / stageH, 0, 0);
+    ctx.clearRect(0, 0, stageW, stageH);
 
-    if (showAxes) {
-      ctx.fillStyle = '#0f141b';
-      ctx.fillRect(0, 0, leftPad, height - scrollH);
-      ctx.fillRect(0, waveH + plotH, width, AXIS_BOTTOM);
-      ctx.strokeStyle = '#293548';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(leftPad + 0.5, 0);
-      ctx.lineTo(leftPad + 0.5, waveH + plotH);
-      ctx.lineTo(width, waveH + plotH + 0.5);
-      ctx.stroke();
+    const windowOffsetSec = file.windowStartSec ?? 0;
+    const startMs = resolveRecordingStartMs(timeCtx);
+    const longRec = isLongRecording(file.totalDurationSec ?? file.durationSec, startMs);
+    const tickSpacing = longRec ? (startMs !== null ? 116 : 98) : 80;
+    const edgePad = longRec ? 36 : 20;
+    const isMulti = rows.length > 1;
 
-      const fTicks = computeNiceTicks(minFreqHz, maxFreqHz, Math.floor(plotH / 42));
-      ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
-      ctx.fillStyle = '#94a3b8';
-      ctx.textAlign = 'right';
-      ctx.textBaseline = 'middle';
-      for (const f of fTicks) {
-        const y = freqToY(f);
-        if (y < waveH + 6 || y > waveH + plotH - 6) continue;
-        const label = f >= 1000 ? `${(f / 1000).toFixed(1)}k` : `${Math.round(f)}`;
-        ctx.fillText(label, leftPad - 6, y);
-        ctx.strokeStyle = '#475569';
+    for (const row of rows) {
+      const rSpanT = Math.max(1e-6, row.endSec - row.startSec);
+
+      if (showAxes) {
+        ctx.fillStyle = '#0f141b';
+        ctx.fillRect(0, row.rowTop, leftPad, row.rowBottom - row.rowTop);
+        ctx.fillRect(0, row.plotTop + row.plotH, stageW, row.axisBottomH);
+
+        ctx.strokeStyle = '#293548';
+        ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.moveTo(leftPad - 4, y);
-        ctx.lineTo(leftPad, y);
+        ctx.moveTo(leftPad + 0.5, row.rowTop);
+        ctx.lineTo(leftPad + 0.5, row.plotTop + row.plotH);
+        ctx.lineTo(stageW, row.plotTop + row.plotH + 0.5);
         ctx.stroke();
 
-        if (win.displaySettings.showGrid) {
-          ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
-          ctx.beginPath();
-          ctx.moveTo(leftPad, y);
-          ctx.lineTo(leftPad + plotW, y);
-          ctx.stroke();
-        }
-      }
-
-      const windowOffsetSec = file.windowStartSec ?? 0;
-      const combinedSegs = isCombinedFileId(file.fileId)
-        ? engine.getCombinedRecording(file.fileId)?.segments
-        : undefined;
-      const timeCtx = buildRecordingTimeContext(file, combinedSegs);
-      const startMs = resolveRecordingStartMs(timeCtx);
-      const longRec = isLongRecording(file.totalDurationSec ?? file.durationSec, startMs);
-      const tickSpacing = longRec ? (startMs !== null ? 116 : 98) : 80;
-      const edgePad = longRec ? 36 : 20;
-
-      const tTicks = computeNiceTicks(startSec, endSec, Math.floor(plotW / tickSpacing));
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'top';
-      for (const t of tTicks) {
-        const x = timeToX(t);
-        if (x < leftPad + edgePad || x > width - edgePad) continue;
+        const fTicks = computeNiceTicks(
+          row.minFreqHz,
+          row.maxFreqHz,
+          Math.max(2, Math.floor(row.plotH / (isMulti ? 36 : 42))),
+        );
+        ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
         ctx.fillStyle = '#94a3b8';
-        const label = formatAxisTickTime(windowOffsetSec + t, spanT, timeCtx);
-        ctx.fillText(label, x, waveH + plotH + 6);
-        ctx.strokeStyle = '#475569';
-        ctx.beginPath();
-        ctx.moveTo(x, waveH + plotH);
-        ctx.lineTo(x, waveH + plotH + 4);
-        ctx.stroke();
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
 
-        if (win.displaySettings.showGrid) {
-          ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
+        for (const f of fTicks) {
+          const y = rowFreqToY(row, f);
+          if (y < row.plotTop + 6 || y > row.plotTop + row.plotH - 6) continue;
+          const label = f >= 1000 ? `${(f / 1000).toFixed(1)}k` : `${Math.round(f)}`;
+          ctx.fillText(label, leftPad - 6, y);
+          ctx.strokeStyle = '#475569';
           ctx.beginPath();
-          ctx.moveTo(x, waveH);
-          ctx.lineTo(x, waveH + plotH);
+          ctx.moveTo(leftPad - 4, y);
+          ctx.lineTo(leftPad, y);
           ctx.stroke();
+
+          if (win.displaySettings.showGrid) {
+            ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
+            ctx.beginPath();
+            ctx.moveTo(leftPad, y);
+            ctx.lineTo(leftPad + plotW, y);
+            ctx.stroke();
+          }
+        }
+
+        const tTicks = computeNiceTicks(row.startSec, row.endSec, Math.floor(plotW / tickSpacing));
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        const labelTopY = row.plotTop + row.plotH + (isMulti ? 3 : 6);
+        for (const t of tTicks) {
+          const x = rowTimeToX(row, t);
+          if (x < leftPad + edgePad || x > stageW - edgePad) continue;
+          ctx.fillStyle = '#94a3b8';
+          const label = formatAxisTickTime(windowOffsetSec + t, rSpanT, timeCtx);
+          ctx.fillText(label, x, labelTopY);
+          ctx.strokeStyle = '#475569';
+          ctx.beginPath();
+          ctx.moveTo(x, row.plotTop + row.plotH);
+          ctx.lineTo(x, row.plotTop + row.plotH + 3);
+          ctx.stroke();
+
+          if (win.displaySettings.showGrid) {
+            ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
+            ctx.beginPath();
+            ctx.moveTo(x, row.plotTop);
+            ctx.lineTo(x, row.plotTop + row.plotH);
+            ctx.stroke();
+          }
         }
       }
-    }
 
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(leftPad, waveH, plotW, plotH);
-    ctx.clip();
+      // Clip to this row's plot rectangle
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(leftPad, row.plotTop, plotW, row.plotH);
+      ctx.clip();
 
-    if (win.displaySettings.showAnnotations && win.displaySettings.showCursors) {
-      for (const ann of visibleAnnotations) {
-        const x0 = timeToX(ann.startTimeSec);
-        const x1 = timeToX(ann.endTimeSec);
-        const yTop = freqToY(ann.highFreqHz);
-        const yBot = freqToY(ann.lowFreqHz);
-        const isSel = ann.id === selectedAnnotationId;
+      if (win.displaySettings.showAnnotations && win.displaySettings.showCursors) {
+        for (const ann of visibleAnnotations) {
+          if (stackChannels && ann.channel && ann.channel !== row.channel + 1) continue;
+          if (ann.endTimeSec < row.startSec || ann.startTimeSec > row.endSec) continue;
 
-        ctx.strokeStyle = isSel ? '#f59e0b' : '#22c55e';
-        ctx.fillStyle = isSel ? 'rgba(245, 158, 11, 0.18)' : 'rgba(34, 197, 94, 0.12)';
-        ctx.lineWidth = isSel ? 2 : 1.25;
-        ctx.fillRect(x0, yTop, Math.max(2, x1 - x0), Math.max(2, yBot - yTop));
-        ctx.strokeRect(x0, yTop, Math.max(2, x1 - x0), Math.max(2, yBot - yTop));
+          const x0 = rowTimeToX(row, ann.startTimeSec);
+          const x1 = rowTimeToX(row, ann.endTimeSec);
+          const yTop = rowFreqToY(row, ann.highFreqHz);
+          const yBot = rowFreqToY(row, ann.lowFreqHz);
+          const isSel = ann.id === selectedAnnotationId;
 
-        if (ann.comment) {
-          ctx.font = 'bold 11px system-ui, sans-serif';
-          const textW = ctx.measureText(ann.comment).width;
-          const labelY = Math.max(waveH + 13, yTop - 3);
-          ctx.fillStyle = isSel ? 'rgba(180, 83, 9, 0.92)' : 'rgba(15, 23, 42, 0.82)';
-          ctx.fillRect(x0, labelY - 12, textW + 8, 14);
-          ctx.fillStyle = '#f8fafc';
-          ctx.textAlign = 'left';
-          ctx.textBaseline = 'bottom';
-          ctx.fillText(ann.comment, x0 + 4, labelY);
+          ctx.strokeStyle = isSel ? '#f59e0b' : '#22c55e';
+          ctx.fillStyle = isSel ? 'rgba(245, 158, 11, 0.18)' : 'rgba(34, 197, 94, 0.12)';
+          ctx.lineWidth = isSel ? 2 : 1.25;
+          ctx.fillRect(x0, yTop, Math.max(2, x1 - x0), Math.max(2, yBot - yTop));
+          ctx.strokeRect(x0, yTop, Math.max(2, x1 - x0), Math.max(2, yBot - yTop));
+
+          if (ann.comment) {
+            ctx.font = 'bold 11px system-ui, sans-serif';
+            const textW = ctx.measureText(ann.comment).width;
+            const labelY = Math.max(row.plotTop + 13, yTop - 3);
+            ctx.fillStyle = isSel ? 'rgba(180, 83, 9, 0.92)' : 'rgba(15, 23, 42, 0.82)';
+            ctx.fillRect(x0, labelY - 12, textW + 8, 14);
+            ctx.fillStyle = '#f8fafc';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'bottom';
+            ctx.fillText(ann.comment, x0 + 4, labelY);
+          }
+
+          if (isSel) {
+            ctx.fillStyle = '#fbbf24';
+            ctx.strokeStyle = '#0f172a';
+            ctx.lineWidth = 1;
+            for (const h of getBoxHandles(x0, yTop, x1, yBot)) {
+              ctx.fillRect(h.x - 3, h.y - 3, 6, 6);
+              ctx.strokeRect(h.x - 3, h.y - 3, 6, 6);
+            }
+          }
         }
+      }
 
-        // Draw 8 resize handles on the selected annotation box
-        if (isSel) {
-          ctx.fillStyle = '#fbbf24';
+      if (win.selection && win.displaySettings.showCursors) {
+        const s = win.selection;
+        const s0 = Math.min(s.startSec, s.endSec);
+        const s1 = Math.max(s.startSec, s.endSec);
+        const channelMatch = !stackChannels || s.channel === row.channel + 1;
+        if (channelMatch && s1 >= row.startSec && s0 <= row.endSec) {
+          const x0 = rowTimeToX(row, s0);
+          const x1 = rowTimeToX(row, s1);
+          const yTop = rowFreqToY(row, Math.max(s.lowFreqHz, s.highFreqHz));
+          const yBot = rowFreqToY(row, Math.min(s.lowFreqHz, s.highFreqHz));
+          ctx.fillStyle = 'rgba(56, 189, 248, 0.16)';
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([4, 3]);
+          ctx.fillRect(x0, yTop, Math.max(2, x1 - x0), Math.max(2, yBot - yTop));
+          ctx.strokeRect(x0, yTop, Math.max(2, x1 - x0), Math.max(2, yBot - yTop));
+          ctx.setLineDash([]);
+
+          ctx.fillStyle = '#38bdf8';
           ctx.strokeStyle = '#0f172a';
           ctx.lineWidth = 1;
           for (const h of getBoxHandles(x0, yTop, x1, yBot)) {
@@ -450,129 +728,191 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
           }
         }
       }
-    }
 
-    if (win.selection && win.displaySettings.showCursors) {
-      const s = win.selection;
-      const x0 = timeToX(Math.min(s.startSec, s.endSec));
-      const x1 = timeToX(Math.max(s.startSec, s.endSec));
-      const yTop = freqToY(Math.max(s.lowFreqHz, s.highFreqHz));
-      const yBot = freqToY(Math.min(s.lowFreqHz, s.highFreqHz));
-      ctx.fillStyle = 'rgba(56, 189, 248, 0.16)';
-      ctx.strokeStyle = '#38bdf8';
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([4, 3]);
-      ctx.fillRect(x0, yTop, Math.max(2, x1 - x0), Math.max(2, yBot - yTop));
-      ctx.strokeRect(x0, yTop, Math.max(2, x1 - x0), Math.max(2, yBot - yTop));
-      ctx.setLineDash([]);
+      if (playheadSec !== null && playheadSec >= row.startSec && playheadSec <= row.endSec) {
+        const px = rowTimeToX(row, playheadSec);
+        ctx.strokeStyle = '#f43f5e';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(px, row.plotTop);
+        ctx.lineTo(px, row.plotTop + row.plotH);
+        ctx.stroke();
+      }
 
-      // Draw 8 resize handles on the active selection box
-      ctx.fillStyle = '#38bdf8';
-      ctx.strokeStyle = '#0f172a';
-      ctx.lineWidth = 1;
-      for (const h of getBoxHandles(x0, yTop, x1, yBot)) {
-        ctx.fillRect(h.x - 3, h.y - 3, 6, 6);
-        ctx.strokeRect(h.x - 3, h.y - 3, 6, 6);
+      // Row identification badge when viewing split time rows or stacked channels
+      if (isMulti && row.badgeText) {
+        ctx.font = '600 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+        const padX = 5;
+        const textW = ctx.measureText(row.badgeText).width;
+        const boxW = Math.min(plotW - 12, textW + padX * 2);
+        const bx = leftPad + 5;
+        const by = row.plotTop + 4;
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.84)';
+        ctx.strokeStyle = 'rgba(71, 85, 105, 0.75)';
+        ctx.lineWidth = 1;
+        ctx.fillRect(bx, by, boxW, 15);
+        ctx.strokeRect(bx, by, boxW, 15);
+        ctx.fillStyle = '#e2e8f0';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(row.badgeText, bx + padX, by + 7.5, Math.max(10, boxW - padX * 2));
+      }
+
+      ctx.restore();
+
+      // Inter-row separator line
+      if (row.rowIndex < rows.length - 1) {
+        const sepY = row.rowBottom + ROW_GAP / 2;
+        ctx.strokeStyle = '#1e293b';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, sepY);
+        ctx.lineTo(stageW, sepY);
+        ctx.stroke();
       }
     }
-
-    if (playheadSec !== null) {
-      const px = timeToX(playheadSec);
-      ctx.strokeStyle = '#f43f5e';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(px, waveH);
-      ctx.lineTo(px, waveH + plotH);
-      ctx.stroke();
-    }
-
-    ctx.restore();
   }, [
-    width,
-    height,
+    rows,
+    stageW,
+    stageH,
     leftPad,
-    scrollH,
-    waveH,
     plotW,
-    plotH,
     showAxes,
-    win.viewRange,
     win.displaySettings,
     win.selection,
     visibleAnnotations,
     selectedAnnotationId,
     playheadSec,
-    file.fileId,
-    file.name,
-    file.startDateTimeIso,
+    stackChannels,
     file.windowStartSec,
     file.totalDurationSec,
     file.durationSec,
-    engine,
+    timeCtx,
   ]);
 
-  const coordsToTimeFreq = (clientX: number, clientY: number) => {
+  const findRowAtY = (rawY: number, anchorRowIndex?: number): RowLayout | null => {
+    if (rows.length === 0) return null;
+    if (anchorRowIndex !== undefined && rows[anchorRowIndex]) {
+      return rows[anchorRowIndex];
+    }
+    for (const r of rows) {
+      if (rawY >= r.rowTop && rawY <= r.rowBottom + ROW_GAP) {
+        return r;
+      }
+    }
+    if (rawY < rows[0].rowTop) return rows[0];
+    return rows[rows.length - 1];
+  };
+
+  const coordsToRowTimeFreq = (clientX: number, clientY: number, anchorRowIndex?: number) => {
     const rect = overlayRef.current?.getBoundingClientRect();
-    if (!rect) return null;
+    if (!rect || rows.length === 0) return null;
     const rawX = clientX - rect.left;
     const rawY = clientY - rect.top;
+    const row = findRowAtY(rawY, anchorRowIndex);
+    if (!row) return null;
+
     const x = rawX - leftPad;
-    const y = rawY - waveH;
+    const y = rawY - row.plotTop;
     const tFrac = Math.max(0, Math.min(1, x / Math.max(1, plotW)));
-    const fFrac = Math.max(0, Math.min(1, 1 - y / Math.max(1, plotH)));
-    const timeSec = startSec + tFrac * spanT;
-    const freqHz = minFreqHz + fFrac * spanF;
-    return { rawX, rawY, x, y, timeSec, freqHz };
+    const fFrac = Math.max(0, Math.min(1, 1 - y / Math.max(1, row.plotH)));
+    const rSpanT = Math.max(1e-6, row.endSec - row.startSec);
+    const rSpanF = Math.max(1e-6, row.maxFreqHz - row.minFreqHz);
+    const timeSec = row.startSec + tFrac * rSpanT;
+    const freqHz = row.minFreqHz + fFrac * rSpanF;
+    return {
+      row,
+      rawX,
+      rawY,
+      x,
+      y,
+      inPlot: x >= 0 && x <= plotW && y >= 0 && y <= row.plotH,
+      timeSec,
+      freqHz,
+    };
   };
 
   const hitTestHandle = (
     rawX: number,
     rawY: number,
   ):
-    | { target: 'sel'; handle: HandleId; cursor: string }
-    | { target: 'ann'; ann: AnnotationRecord; handle: HandleId; cursor: string }
+    | { target: 'sel'; rowIndex: number; handle: HandleId; cursor: string }
+    | { target: 'ann'; rowIndex: number; ann: AnnotationRecord; handle: HandleId; cursor: string }
     | null => {
     if (!win.displaySettings.showCursors) return null;
+    const row = findRowAtY(rawY);
+    if (!row) return null;
+
     if (win.selection) {
       const s = win.selection;
-      const x0 = timeToX(Math.min(s.startSec, s.endSec));
-      const x1 = timeToX(Math.max(s.startSec, s.endSec));
-      const yTop = freqToY(Math.max(s.lowFreqHz, s.highFreqHz));
-      const yBot = freqToY(Math.min(s.lowFreqHz, s.highFreqHz));
-      for (const h of getBoxHandles(x0, yTop, x1, yBot)) {
-        if (Math.abs(rawX - h.x) <= HANDLE_RADIUS && Math.abs(rawY - h.y) <= HANDLE_RADIUS) {
-          return { target: 'sel', handle: h.id, cursor: h.cursor };
+      const channelMatch = !stackChannels || s.channel === row.channel + 1;
+      const s0 = Math.min(s.startSec, s.endSec);
+      const s1 = Math.max(s.startSec, s.endSec);
+      if (channelMatch && s1 >= row.startSec && s0 <= row.endSec) {
+        const x0 = rowTimeToX(row, s0);
+        const x1 = rowTimeToX(row, s1);
+        const yTop = rowFreqToY(row, Math.max(s.lowFreqHz, s.highFreqHz));
+        const yBot = rowFreqToY(row, Math.min(s.lowFreqHz, s.highFreqHz));
+        for (const h of getBoxHandles(x0, yTop, x1, yBot)) {
+          if (Math.abs(rawX - h.x) <= HANDLE_RADIUS && Math.abs(rawY - h.y) <= HANDLE_RADIUS) {
+            return { target: 'sel', rowIndex: row.rowIndex, handle: h.id, cursor: h.cursor };
+          }
         }
       }
     }
+
     const selAnn = visibleAnnotations.find((a) => a.id === selectedAnnotationId);
-    if (selAnn && win.displaySettings.showAnnotations) {
-      const x0 = timeToX(selAnn.startTimeSec);
-      const x1 = timeToX(selAnn.endTimeSec);
-      const yTop = freqToY(selAnn.highFreqHz);
-      const yBot = freqToY(selAnn.lowFreqHz);
+    if (
+      selAnn &&
+      win.displaySettings.showAnnotations &&
+      (!stackChannels || !selAnn.channel || selAnn.channel === row.channel + 1) &&
+      selAnn.endTimeSec >= row.startSec &&
+      selAnn.startTimeSec <= row.endSec
+    ) {
+      const x0 = rowTimeToX(row, selAnn.startTimeSec);
+      const x1 = rowTimeToX(row, selAnn.endTimeSec);
+      const yTop = rowFreqToY(row, selAnn.highFreqHz);
+      const yBot = rowFreqToY(row, selAnn.lowFreqHz);
       for (const h of getBoxHandles(x0, yTop, x1, yBot)) {
         if (Math.abs(rawX - h.x) <= HANDLE_RADIUS && Math.abs(rawY - h.y) <= HANDLE_RADIUS) {
-          return { target: 'ann', ann: selAnn, handle: h.id, cursor: h.cursor };
+          return {
+            target: 'ann',
+            rowIndex: row.rowIndex,
+            ann: selAnn,
+            handle: h.id,
+            cursor: h.cursor,
+          };
         }
       }
     }
     return null;
   };
 
-  const sampleMagnitudeAt = (timeSec: number, freqHz: number): number | undefined => {
-    if (!matrix || matrix.numTimeBins === 0 || matrix.numFreqBins === 0) return undefined;
-    const tNorm = (timeSec - matrix.startSec) / Math.max(1e-6, matrix.endSec - matrix.startSec);
-    const fNorm = (freqHz - matrix.minFreqHz) / Math.max(1e-6, matrix.maxFreqHz - matrix.minFreqHz);
+  const sampleMagnitudeAt = (
+    channel: number,
+    timeSec: number,
+    freqHz: number,
+  ): number | undefined => {
+    const mat =
+      activeMatricesByChannel[channel] ??
+      getCachedSpectrogram(specCache, file.fileId, { ...win.specParams, channel });
+    if (!mat || mat.numTimeBins === 0 || mat.numFreqBins === 0) return undefined;
+    const tNorm = (timeSec - mat.startSec) / Math.max(1e-6, mat.endSec - mat.startSec);
+    const fNorm = (freqHz - mat.minFreqHz) / Math.max(1e-6, mat.maxFreqHz - mat.minFreqHz);
     if (tNorm < 0 || tNorm > 1 || fNorm < 0 || fNorm > 1) return undefined;
-    const ti = Math.min(matrix.numTimeBins - 1, Math.max(0, Math.round(tNorm * (matrix.numTimeBins - 1))));
-    const fi = Math.min(matrix.numFreqBins - 1, Math.max(0, Math.round(fNorm * (matrix.numFreqBins - 1))));
-    return matrix.data[ti * matrix.numFreqBins + fi];
+    const ti = Math.min(mat.numTimeBins - 1, Math.max(0, Math.round(tNorm * (mat.numTimeBins - 1))));
+    const fi = Math.min(mat.numFreqBins - 1, Math.max(0, Math.round(fNorm * (mat.numFreqBins - 1))));
+    return mat.data[ti * mat.numFreqBins + fi];
   };
 
-  const findAnnotationAt = (timeSec: number, freqHz: number): AnnotationRecord | undefined => {
+  const findAnnotationAt = (
+    channel: number,
+    timeSec: number,
+    freqHz: number,
+  ): AnnotationRecord | undefined => {
     return visibleAnnotations.find(
       (a) =>
+        (!stackChannels || !a.channel || a.channel === channel + 1) &&
         timeSec >= a.startTimeSec &&
         timeSec <= a.endTimeSec &&
         freqHz >= a.lowFreqHz &&
@@ -582,14 +922,14 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
 
   const handleMouseDown = (e: React.MouseEvent) => {
     setContextMenu(null);
-    const pt = coordsToTimeFreq(e.clientX, e.clientY);
-    if (!pt || pt.x < 0 || pt.y < 0 || pt.x > plotW || pt.y > plotH) return;
+    const pt = coordsToRowTimeFreq(e.clientX, e.clientY);
+    if (!pt || !pt.inPlot) return;
 
-    // Middle click or Shift+Left drag pans
     if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
       e.preventDefault();
       dragModeRef.current = {
         kind: 'pan',
+        anchorRowIndex: pt.row.rowIndex,
         startX: e.clientX,
         startY: e.clientY,
         origRange: { ...win.viewRange },
@@ -598,13 +938,13 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     }
 
     if (e.button === 0) {
-      // Check draggable resize handles on selection or selected annotation
       const handleHit = hitTestHandle(pt.rawX, pt.rawY);
       if (handleHit) {
         e.preventDefault();
         if (handleHit.target === 'sel' && win.selection) {
           dragModeRef.current = {
             kind: 'resize_sel',
+            anchorRowIndex: handleHit.rowIndex,
             handle: handleHit.handle,
             orig: {
               startSec: Math.min(win.selection.startSec, win.selection.endSec),
@@ -619,6 +959,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         if (handleHit.target === 'ann') {
           dragModeRef.current = {
             kind: 'resize_ann',
+            anchorRowIndex: handleHit.rowIndex,
             annId: handleHit.ann.id,
             handle: handleHit.handle,
             orig: {
@@ -632,12 +973,14 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         }
       }
 
-      const hit = findAnnotationAt(pt.timeSec, pt.freqHz);
+      const hit = findAnnotationAt(pt.row.channel, pt.timeSec, pt.freqHz);
       if (hit && !e.altKey && !redefineAnnotationId) {
         selectAnnotation(hit.id, false);
       }
       dragModeRef.current = {
         kind: 'select',
+        anchorRowIndex: pt.row.rowIndex,
+        channel: pt.row.channel,
         startT: pt.timeSec,
         startF: pt.freqHz,
       };
@@ -645,21 +988,26 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    const pt = coordsToTimeFreq(e.clientX, e.clientY);
-    if (pt && pt.x >= 0 && pt.x <= plotW && pt.y >= 0 && pt.y <= plotH) {
+    const drag = dragModeRef.current;
+    const pt = coordsToRowTimeFreq(
+      e.clientX,
+      e.clientY,
+      drag ? drag.anchorRowIndex : undefined,
+    );
+
+    if (pt && pt.inPlot) {
       setCursorReadout({
         timeSec: pt.timeSec,
         freqHz: pt.freqHz,
-        valueDb: sampleMagnitudeAt(pt.timeSec, pt.freqHz),
-        channel: win.specParams.channel + 1,
+        valueDb: sampleMagnitudeAt(pt.row.channel, pt.timeSec, pt.freqHz),
+        channel: pt.row.channel + 1,
       });
-      if (!dragModeRef.current) {
+      if (!drag) {
         const hit = hitTestHandle(pt.rawX, pt.rawY);
         setCursorStyle(hit ? hit.cursor : 'crosshair');
       }
     }
 
-    const drag = dragModeRef.current;
     if (!drag || !pt) return;
     const nyquist = file.sampleRate / 2;
 
@@ -669,7 +1017,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         endSec: pt.timeSec,
         lowFreqHz: Math.min(drag.startF, pt.freqHz),
         highFreqHz: Math.max(drag.startF, pt.freqHz),
-        channel: win.specParams.channel + 1,
+        channel: drag.channel + 1,
       });
     } else if (drag.kind === 'resize_sel') {
       const next = applyHandleDrag(drag.orig, drag.handle, pt.timeSec, pt.freqHz, file.durationSec, nyquist);
@@ -686,10 +1034,10 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
       const dx = e.clientX - drag.startX;
       const dy = e.clientY - drag.startY;
       const orig = drag.origRange;
-      const oSpanT = orig.endSec - orig.startSec;
+      const rowSpanT = (orig.endSec - orig.startSec) / splitTimeRows;
       const oSpanF = orig.maxFreqHz - orig.minFreqHz;
-      const dt = (-dx / Math.max(1, plotW)) * oSpanT;
-      const df = (dy / Math.max(1, plotH)) * oSpanF;
+      const dt = (-dx / Math.max(1, plotW)) * rowSpanT;
+      const df = (dy / Math.max(1, pt.row.plotH)) * oSpanF;
 
       let nextStartT = orig.startSec + dt;
       let nextEndT = orig.endSec + dt;
@@ -747,9 +1095,13 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
   };
 
   const handleWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const pt = coordsToTimeFreq(e.clientX, e.clientY);
+    const pt = coordsToRowTimeFreq(e.clientX, e.clientY);
     if (!pt) return;
+    // Allow normal vertical wheel scrolling when mouse is outside plot gutter in multi-row scroll mode
+    if (isVertScrollable && pt.x < 0 && !e.ctrlKey && !e.altKey) {
+      return;
+    }
+    e.preventDefault();
     const zoomFactor = e.deltaY < 0 ? 0.8 : 1.25;
     const nyquist = file.sampleRate / 2;
 
@@ -764,7 +1116,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         maxFreqHz: nextMax,
       });
     } else {
-      const newSpanT = Math.max(0.02, Math.min(file.durationSec, spanT * zoomFactor));
+      const newSpanT = Math.max(0.02 * splitTimeRows, Math.min(file.durationSec, spanT * zoomFactor));
       const frac = (pt.timeSec - startSec) / spanT;
       const nextStart = Math.max(0, pt.timeSec - frac * newSpanT);
       const nextEnd = Math.min(file.durationSec, nextStart + newSpanT);
@@ -782,14 +1134,16 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     });
   };
 
-  // Classic Syrinx: double-click plays annotation under cursor or the file
+  // Classic Syrinx: double-click plays annotation under cursor or the row/window view
   const handleDoubleClick = (e: React.MouseEvent) => {
-    const pt = coordsToTimeFreq(e.clientX, e.clientY);
+    const pt = coordsToRowTimeFreq(e.clientX, e.clientY);
     if (!pt) return;
-    const hit = findAnnotationAt(pt.timeSec, pt.freqHz);
+    const hit = findAnnotationAt(pt.row.channel, pt.timeSec, pt.freqHz);
     if (hit) {
       selectAnnotation(hit.id, false);
       playRange(hit.startTimeSec, hit.endTimeSec);
+    } else if (splitTimeRows > 1) {
+      playRange(pt.row.startSec, pt.row.endSec);
     } else {
       playRange(win.viewRange.startSec, win.viewRange.endSec);
     }
@@ -797,22 +1151,24 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
 
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
-    const pt = coordsToTimeFreq(e.clientX, e.clientY);
-    const hit = pt ? findAnnotationAt(pt.timeSec, pt.freqHz) ?? null : null;
+    const pt = coordsToRowTimeFreq(e.clientX, e.clientY);
+    const hit = pt ? findAnnotationAt(pt.row.channel, pt.timeSec, pt.freqHz) ?? null : null;
     if (hit) selectAnnotation(hit.id, false);
     setContextMenu({ x: e.clientX, y: e.clientY, annotation: hit });
   };
 
   const handleCopyImage = async () => {
-    if (!matrix) return;
+    if (!primaryRenderMatrix) return;
     try {
       const mode = await copySpectrogramImageToClipboard(
-        matrix,
+        primaryRenderMatrix,
         win.viewRange,
         win.displaySettings,
         file.name,
         Math.max(800, Math.round(plotW * 1.5)),
-        Math.max(360, Math.round(plotH * 1.5)),
+        Math.max(360, Math.round((rows[0]?.plotH ?? 300) * Math.min(4, rows.length) * 1.4)),
+        activeMatricesByChannel,
+        displayedChannels,
       );
       setStatus(
         mode === 'clipboard'
@@ -843,18 +1199,6 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
   const maxScrollStart = Math.max(0, file.durationSec - spanT);
   const nyquist = file.sampleRate / 2;
 
-  const clientToPlot = (clientX: number, clientY: number) => {
-    const rect = overlayRef.current?.getBoundingClientRect();
-    const x = rect ? clientX - rect.left : 0;
-    const y = rect ? clientY - rect.top : 0;
-    const t = Math.max(0, Math.min(file.durationSec, startSec + ((x - leftPad) / plotW) * spanT));
-    const f = Math.max(
-      0,
-      Math.min(nyquist, minFreqHz + (1 - (y - waveH) / plotH) * spanF),
-    );
-    return { x, y, t, f };
-  };
-
   const handleTouchStart = (e: React.TouchEvent<HTMLCanvasElement>) => {
     if (e.touches.length === 2) {
       e.preventDefault();
@@ -866,6 +1210,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         midX: 0.5 * (t0.clientX + t1.clientX),
         midY: 0.5 * (t0.clientY + t1.clientY),
         origRange: { ...win.viewRange },
+        rowSpanT: (win.viewRange.endSec - win.viewRange.startSec) / splitTimeRows,
       };
       return;
     }
@@ -890,24 +1235,31 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     if (window.innerWidth <= 768 && (touch.clientX <= 24 || touch.clientX >= window.innerWidth - 24)) {
       return;
     }
-    const { x, y, t, f } = clientToPlot(touch.clientX, touch.clientY);
-    if (x < leftPad || y < waveH || y > waveH + plotH) return;
+    const pt = coordsToRowTimeFreq(touch.clientX, touch.clientY);
+    if (!pt || !pt.inPlot) return;
 
     if (touchMode === 'pan') {
       dragModeRef.current = {
         kind: 'pan',
+        anchorRowIndex: pt.row.rowIndex,
         startX: touch.clientX,
         startY: touch.clientY,
         origRange: { ...win.viewRange },
       };
     } else {
-      dragModeRef.current = { kind: 'select', startT: t, startF: f };
+      dragModeRef.current = {
+        kind: 'select',
+        anchorRowIndex: pt.row.rowIndex,
+        channel: pt.row.channel,
+        startT: pt.timeSec,
+        startF: pt.freqHz,
+      };
       updateWindowSelection(win.windowId, {
-        startSec: t,
-        endSec: t,
-        lowFreqHz: f,
-        highFreqHz: f,
-        channel: win.specParams.channel + 1,
+        startSec: pt.timeSec,
+        endSec: pt.timeSec,
+        lowFreqHz: pt.freqHz,
+        highFreqHz: pt.freqHz,
+        channel: pt.row.channel + 1,
       });
     }
   };
@@ -918,17 +1270,17 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
       const [t0, t1] = [e.touches[0], e.touches[1]];
       const curDistX = Math.max(12, Math.abs(t1.clientX - t0.clientX));
       const curMidX = 0.5 * (t0.clientX + t1.clientX);
-      const { distX, midX, origRange } = pinchRef.current;
+      const { distX, midX, origRange, rowSpanT } = pinchRef.current;
 
       const origSpanT = Math.max(0.02, origRange.endSec - origRange.startSec);
       const zoomFactor = Math.max(0.25, Math.min(4.0, distX / curDistX));
-      const newSpanT = Math.max(0.02, Math.min(file.durationSec, origSpanT * zoomFactor));
+      const newSpanT = Math.max(0.02 * splitTimeRows, Math.min(file.durationSec, origSpanT * zoomFactor));
       const rect = overlayRef.current?.getBoundingClientRect();
       const anchorFrac = rect
         ? Math.max(0, Math.min(1, (midX - rect.left - leftPad) / plotW))
         : 0.5;
       const anchorT = origRange.startSec + anchorFrac * origSpanT;
-      const panDt = ((midX - curMidX) / plotW) * newSpanT;
+      const panDt = ((midX - curMidX) / plotW) * (rowSpanT * zoomFactor);
 
       let ns = anchorT - anchorFrac * newSpanT + panDt;
       ns = Math.max(0, Math.min(Math.max(0, file.durationSec - newSpanT), ns));
@@ -944,12 +1296,16 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     e.preventDefault();
     const touch = e.touches[0];
     const mode = dragModeRef.current;
+    const pt = coordsToRowTimeFreq(touch.clientX, touch.clientY, mode.anchorRowIndex);
+    if (!pt) return;
+
     if (mode.kind === 'pan') {
       const orig = mode.origRange;
       const oSpanT = orig.endSec - orig.startSec;
+      const rowSpanT = oSpanT / splitTimeRows;
       const oSpanF = orig.maxFreqHz - orig.minFreqHz;
-      const dt = -((touch.clientX - mode.startX) / plotW) * oSpanT;
-      const df = ((touch.clientY - mode.startY) / plotH) * oSpanF;
+      const dt = -((touch.clientX - mode.startX) / plotW) * rowSpanT;
+      const df = ((touch.clientY - mode.startY) / Math.max(1, pt.row.plotH)) * oSpanF;
       const ns = Math.max(0, Math.min(Math.max(0, file.durationSec - oSpanT), orig.startSec + dt));
       const nf = Math.max(0, Math.min(Math.max(0, nyquist - oSpanF), orig.minFreqHz + df));
       updateWindowViewRange(win.windowId, {
@@ -959,13 +1315,12 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         maxFreqHz: Math.min(nyquist, nf + oSpanF),
       });
     } else if (mode.kind === 'select') {
-      const { t, f } = clientToPlot(touch.clientX, touch.clientY);
       updateWindowSelection(win.windowId, {
-        startSec: Math.min(mode.startT, t),
-        endSec: Math.max(mode.startT, t),
-        lowFreqHz: Math.min(mode.startF, f),
-        highFreqHz: Math.max(mode.startF, f),
-        channel: win.specParams.channel + 1,
+        startSec: Math.min(mode.startT, pt.timeSec),
+        endSec: Math.max(mode.startT, pt.timeSec),
+        lowFreqHz: Math.min(mode.startF, pt.freqHz),
+        highFreqHz: Math.max(mode.startF, pt.freqHz),
+        channel: mode.channel + 1,
       });
     }
   };
@@ -977,7 +1332,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
 
   const zoomTimeBy = (factor: number) => {
     const mid = 0.5 * (startSec + endSec);
-    const nextSpan = Math.max(0.02, Math.min(file.durationSec, spanT * factor));
+    const nextSpan = Math.max(0.02 * splitTimeRows, Math.min(file.durationSec, spanT * factor));
     const ns = Math.max(0, Math.min(Math.max(0, file.durationSec - nextSpan), mid - nextSpan / 2));
     updateWindowViewRange(win.windowId, {
       ...win.viewRange,
@@ -995,51 +1350,86 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         dragModeRef.current = null;
       }}
     >
-      {showWave && (
-        <div style={{ position: 'absolute', left: leftPad, top: 0 }}>
-          <WaveformCanvas
-            waveform={waveform}
-            viewRange={win.viewRange}
-            selection={win.displaySettings.showCursors ? win.selection : null}
-            playheadSec={playheadSec}
-            width={plotW}
-            height={waveH}
+      <div
+        className="spec-rows-stage"
+        style={{
+          position: 'relative',
+          width: `${width}px`,
+          height: `${viewportH}px`,
+          overflowY: isVertScrollable ? 'auto' : 'hidden',
+          overflowX: 'hidden',
+        }}
+      >
+        <div
+          style={{
+            position: 'relative',
+            width: `${stageW}px`,
+            height: `${stageH}px`,
+          }}
+        >
+          {showWave &&
+            rows.map((row) => {
+              const wf = waveformCache[`${file.fileId}|${row.channel}`];
+              const rowSel =
+                win.displaySettings.showCursors &&
+                win.selection &&
+                (!stackChannels || win.selection.channel === row.channel + 1)
+                  ? win.selection
+                  : null;
+              return (
+                <div
+                  key={`wf-${row.rowIndex}`}
+                  style={{ position: 'absolute', left: leftPad, top: row.waveTop }}
+                >
+                  <WaveformCanvas
+                    waveform={wf}
+                    viewRange={{
+                      startSec: row.startSec,
+                      endSec: row.endSec,
+                      minFreqHz: row.minFreqHz,
+                      maxFreqHz: row.maxFreqHz,
+                    }}
+                    selection={rowSel}
+                    playheadSec={playheadSec}
+                    width={plotW}
+                    height={row.waveH}
+                  />
+                </div>
+              );
+            })}
+
+          <div style={{ position: 'absolute', left: leftPad, top: 0 }}>
+            <WebGLSpectrogramCanvas
+              rows={webglRows}
+              displaySettings={win.displaySettings}
+              width={plotW}
+              height={stageH}
+            />
+          </div>
+
+          <canvas
+            ref={overlayRef}
+            style={{
+              position: 'absolute',
+              left: 0,
+              top: 0,
+              width: `${stageW}px`,
+              height: `${stageH}px`,
+              cursor: cursorStyle,
+              touchAction: isVertScrollable && touchMode === 'pan' ? 'pan-y' : 'none',
+            }}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onWheel={handleWheel}
+            onDoubleClick={handleDoubleClick}
+            onContextMenu={handleContextMenu}
+            onTouchStart={handleTouchStart}
+            onTouchMove={handleTouchMove}
+            onTouchEnd={handleTouchEnd}
           />
         </div>
-      )}
-
-      <div style={{ position: 'absolute', left: leftPad, top: waveH }}>
-        <WebGLSpectrogramCanvas
-          matrix={activeRenderMatrix}
-          viewRange={win.viewRange}
-          displaySettings={win.displaySettings}
-          bitmapFallbackUrl={bitmapFallbackUrl}
-          width={plotW}
-          height={plotH}
-        />
       </div>
-
-      <canvas
-        ref={overlayRef}
-        style={{
-          position: 'absolute',
-          left: 0,
-          top: 0,
-          width: `${width}px`,
-          height: `${height - scrollH}px`,
-          cursor: cursorStyle,
-          touchAction: 'none',
-        }}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onWheel={handleWheel}
-        onDoubleClick={handleDoubleClick}
-        onContextMenu={handleContextMenu}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-      />
 
       <div className="mobile-touch-hud">
         <button
@@ -1235,7 +1625,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
             onClick={() => {
               normalizeWindowGain(win.windowId, {
                 scope: win.selection ? 'selection' : 'view',
-                matrix: activeRenderMatrix,
+                matrix: primaryRenderMatrix,
               });
               setContextMenu(null);
             }}

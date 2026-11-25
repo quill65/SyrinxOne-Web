@@ -36,7 +36,9 @@ export const MeasurementInspector: React.FC = () => {
       setBusy(true);
       void engine
         .measureSelection(activeFile.fileId, {
-          channel: activeWin.specParams.channel,
+          channel: sel.channel
+            ? Math.max(0, Math.min(activeFile.numChannels - 1, sel.channel - 1))
+            : activeWin.specParams.channel,
           startSec: Math.min(sel.startSec, sel.endSec),
           endSec: Math.max(sel.startSec, sel.endSec),
           lowFreqHz: Math.min(sel.lowFreqHz, sel.highFreqHz),
@@ -62,9 +64,11 @@ export const MeasurementInspector: React.FC = () => {
   }, [
     engine,
     activeFile?.fileId,
+    activeFile?.numChannels,
     activeWin?.specParams.channel,
     activeWin?.specParams.fftSize,
     activeWin?.specParams.hopSize,
+    sel?.channel,
     sel?.startSec,
     sel?.endSec,
     sel?.lowFreqHz,

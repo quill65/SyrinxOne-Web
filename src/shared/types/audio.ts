@@ -165,6 +165,10 @@ export interface DisplaySettings {
   showCursors: boolean;
   lockSettings: boolean;
   interpolation: 'nearest' | 'linear';
+  /** Number of contiguous horizontal time-split rows (1..10) */
+  splitTimeRows: number;
+  /** When true, display all audio channels as stacked rows */
+  stackAllChannels: boolean;
 }
 
 export interface SpectrogramMatrix {
@@ -267,4 +271,6 @@ export const DEFAULT_DISPLAY_SETTINGS: DisplaySettings = {
   showCursors: true,
   lockSettings: false,
   interpolation: 'linear',
+  splitTimeRows: 1,
+  stackAllChannels: false,
 };

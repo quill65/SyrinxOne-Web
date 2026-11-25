@@ -775,6 +775,24 @@ body,
   font-size: 12px;
 }
 
+.spec-rows-stage {
+  scrollbar-width: thin;
+  scrollbar-color: #334155 #0b0f14;
+}
+
+.spec-rows-stage::-webkit-scrollbar {
+  width: 8px;
+}
+
+.spec-rows-stage::-webkit-scrollbar-track {
+  background: #0b0f14;
+}
+
+.spec-rows-stage::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+
 .spec-scrollbar-wrap {
   display: flex;
   align-items: center;

@@ -21,6 +21,7 @@ export const MDIChildWindow: React.FC<Props> = ({ win, file, isActive }) => {
   const closeWindow = useWorkspaceStore((s) => s.closeWindow);
   const updateWindowGeometry = useWorkspaceStore((s) => s.updateWindowGeometry);
   const updateWindowSpecParams = useWorkspaceStore((s) => s.updateWindowSpecParams);
+  const updateWindowDisplaySettings = useWorkspaceStore((s) => s.updateWindowDisplaySettings);
   const updateWindowViewRange = useWorkspaceStore((s) => s.updateWindowViewRange);
   const toggleWindowLinkGroup = useWorkspaceStore((s) => s.toggleWindowLinkGroup);
 
@@ -154,12 +155,21 @@ export const MDIChildWindow: React.FC<Props> = ({ win, file, isActive }) => {
             {file.numChannels > 1 && (
               <select
                 className="mdi-chan-select"
-                value={win.specParams.channel}
-                onChange={(e) =>
-                  void updateWindowSpecParams(win.windowId, { channel: Number(e.target.value) })
-                }
-                title="Active Channel"
+                value={win.displaySettings.stackAllChannels ? -1 : win.specParams.channel}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  if (val === -1) {
+                    updateWindowDisplaySettings(win.windowId, { stackAllChannels: true });
+                  } else {
+                    if (win.displaySettings.stackAllChannels) {
+                      updateWindowDisplaySettings(win.windowId, { stackAllChannels: false });
+                    }
+                    void updateWindowSpecParams(win.windowId, { channel: val });
+                  }
+                }}
+                title="Active Channel or Stack All Channels"
               >
+                <option value={-1}>All {file.numChannels} Ch (Stacked)</option>
                 {Array.from({ length: file.numChannels }, (_, idx) => (
                   <option key={idx} value={idx}>
                     Ch {idx + 1}

@@ -3,9 +3,19 @@ import type { DisplaySettings, SpectrogramMatrix, TimeFreqRange } from '@syrinxo
 import { downsampleSpectrogramTime } from '../../utils/spectrogramFetch';
 import { buildColormapRGBA } from './colormaps';
 
-interface Props {
+export interface SpectrogramRenderRow {
+  key: string;
   matrix: SpectrogramMatrix | undefined;
   viewRange: TimeFreqRange;
+  topPx: number;
+  heightPx: number;
+  bitmapFallbackUrl?: string;
+}
+
+interface Props {
+  matrix?: SpectrogramMatrix | undefined;
+  viewRange?: TimeFreqRange;
+  rows?: SpectrogramRenderRow[];
   displaySettings: DisplaySettings;
   bitmapFallbackUrl?: string;
   width: number;
@@ -67,7 +77,7 @@ function compileShader(gl: WebGL2RenderingContext, type: number, src: string): W
 interface GlResources {
   gl: WebGL2RenderingContext;
   program: WebGLProgram;
-  specTex: WebGLTexture;
+  texByMatrix: Map<SpectrogramMatrix, WebGLTexture>;
   lutTex: WebGLTexture;
   vao: WebGLVertexArrayObject;
   uTime: WebGLUniformLocation | null;
@@ -80,6 +90,7 @@ interface GlResources {
 export const WebGLSpectrogramCanvas: React.FC<Props> = ({
   matrix,
   viewRange,
+  rows,
   displaySettings,
   bitmapFallbackUrl,
   width,
@@ -87,13 +98,29 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const glResRef = useRef<GlResources | null>(null);
-  const uploadedMatrixRef = useRef<SpectrogramMatrix | null>(null);
   const uploadedColormapRef = useRef<string | null>(null);
 
-  const useBitmapImg =
-    displaySettings.renderMode === 'server_bitmap' && Boolean(bitmapFallbackUrl);
+  const effectiveRows: SpectrogramRenderRow[] =
+    rows && rows.length > 0
+      ? rows
+      : viewRange
+        ? [
+            {
+              key: 'single',
+              matrix,
+              viewRange,
+              topPx: 0,
+              heightPx: height,
+              bitmapFallbackUrl,
+            },
+          ]
+        : [];
 
-  // Initialize WebGL2 context & program once
+  const useBitmapImg =
+    displaySettings.renderMode === 'server_bitmap' &&
+    effectiveRows.some((r) => Boolean(r.bitmapFallbackUrl));
+
+  // Initialize ONE WebGL2 context & program once for all stacked rows
   useEffect(() => {
     if (useBitmapImg) return;
     const canvas = canvasRef.current;
@@ -101,7 +128,6 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
     const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
     if (!gl) return;
 
-    // Enable float texture linear filtering if supported
     gl.getExtension('OES_texture_float_linear');
 
     const vs = compileShader(gl, gl.VERTEX_SHADER, VERT_SRC);
@@ -126,11 +152,6 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
     gl.enableVertexAttribArray(aPos);
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
-    const specTex = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, specTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-
     const lutTex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, lutTex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -142,10 +163,11 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
     gl.uniform1i(gl.getUniformLocation(program, 'u_specTex'), 0);
     gl.uniform1i(gl.getUniformLocation(program, 'u_lutTex'), 1);
 
+    const texByMatrix = new Map<SpectrogramMatrix, WebGLTexture>();
     glResRef.current = {
       gl,
       program,
-      specTex,
+      texByMatrix,
       lutTex,
       vao,
       uTime: gl.getUniformLocation(program, 'u_timeUvRange'),
@@ -154,11 +176,13 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
       uThresh: gl.getUniformLocation(program, 'u_thresholdDb'),
       uDyn: gl.getUniformLocation(program, 'u_dynamicRangeDb'),
     };
-    uploadedMatrixRef.current = null;
     uploadedColormapRef.current = null;
 
     return () => {
-      gl.deleteTexture(specTex);
+      for (const tex of texByMatrix.values()) {
+        gl.deleteTexture(tex);
+      }
+      texByMatrix.clear();
       gl.deleteTexture(lutTex);
       gl.deleteBuffer(vbo);
       gl.deleteVertexArray(vao);
@@ -167,55 +191,54 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
     };
   }, [useBitmapImg]);
 
-  // Upload spectrogram Float32 texture & draw on any display/view change (60fps GPU)
+  // Upload spectrogram Float32 textures & draw all rows in 1 GPU pass
   useEffect(() => {
     if (useBitmapImg) return;
     const res = glResRef.current;
     const canvas = canvasRef.current;
-    if (!res || !canvas || !matrix || matrix.numTimeBins === 0 || matrix.numFreqBins === 0) {
+    if (!res || !canvas || width <= 0 || height <= 0) {
       return;
     }
 
-    const { gl } = res;
-    const dpr = window.devicePixelRatio || 1;
-    const pxW = Math.max(1, Math.round(width * dpr));
-    const pxH = Math.max(1, Math.round(height * dpr));
+    const { gl, texByMatrix } = res;
+    const baseDpr = window.devicePixelRatio || 1;
+    const maxDim = 4096;
+    const effDpr = Math.min(baseDpr, maxDim / Math.max(1, height), maxDim / Math.max(1, width));
+    const pxW = Math.max(1, Math.round(width * effDpr));
+    const pxH = Math.max(1, Math.round(height * effDpr));
     if (canvas.width !== pxW || canvas.height !== pxH) {
       canvas.width = pxW;
       canvas.height = pxH;
     }
 
-    // Upload spectrogram data only when the Float32 matrix actually changed
-    if (uploadedMatrixRef.current !== matrix) {
-      const maxTex = (gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) || 4096;
-      const uploadMat =
-        matrix.numTimeBins > maxTex ? downsampleSpectrogramTime(matrix, maxTex) : matrix;
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, res.specTex);
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-      // Row-major [timeIndex * numFreqBins + freqIndex] => texture width=numFreqBins, height=numTimeBins
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.R32F,
-        uploadMat.numFreqBins,
-        uploadMat.numTimeBins,
-        0,
-        gl.RED,
-        gl.FLOAT,
-        uploadMat.data,
-      );
-      uploadedMatrixRef.current = matrix;
+    const scaleY = pxH / Math.max(1, height);
+
+    // Clear full canvas stage once
+    gl.disable(gl.SCISSOR_TEST);
+    gl.viewport(0, 0, pxW, pxH);
+    gl.clearColor(0.043, 0.059, 0.078, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    // Collect currently active matrices so stale textures are freed
+    const activeMatrices = new Set<SpectrogramMatrix>();
+    for (const r of effectiveRows) {
+      if (r.matrix && r.matrix.numTimeBins > 0 && r.matrix.numFreqBins > 0) {
+        activeMatrices.add(r.matrix);
+      }
+    }
+    for (const [mat, tex] of texByMatrix.entries()) {
+      if (!activeMatrices.has(mat)) {
+        gl.deleteTexture(tex);
+        texByMatrix.delete(mat);
+      }
     }
 
-    // Filter mode (check float linear extension support)
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, res.specTex);
+    if (activeMatrices.size === 0) return;
+
+    const maxTex = (gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) || 4096;
     const hasLinear = Boolean(gl.getExtension('OES_texture_float_linear'));
     const filter =
       displaySettings.interpolation === 'linear' && hasLinear ? gl.LINEAR : gl.NEAREST;
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
 
     // Upload 1D colormap LUT only when colormap changed
     if (uploadedColormapRef.current !== displaySettings.colormap) {
@@ -226,38 +249,98 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
       uploadedColormapRef.current = displaySettings.colormap;
     }
 
-    const totalTime = Math.max(1e-6, matrix.endSec - matrix.startSec);
-    const totalFreq = Math.max(1e-6, matrix.maxFreqHz - matrix.minFreqHz);
-    const t0 = (viewRange.startSec - matrix.startSec) / totalTime;
-    const t1 = (viewRange.endSec - matrix.startSec) / totalTime;
-    const f0 = (viewRange.minFreqHz - matrix.minFreqHz) / totalFreq;
-    const f1 = (viewRange.maxFreqHz - matrix.minFreqHz) / totalFreq;
-
-    gl.viewport(0, 0, pxW, pxH);
     gl.useProgram(res.program);
     gl.bindVertexArray(res.vao);
-    gl.uniform2f(res.uTime, t0, t1);
-    gl.uniform2f(res.uFreq, f0, f1);
     gl.uniform1f(res.uGain, displaySettings.gainDb);
     gl.uniform1f(res.uThresh, displaySettings.thresholdDb);
     gl.uniform1f(res.uDyn, displaySettings.dynamicRangeDb);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-  }, [matrix, viewRange, displaySettings, width, height, useBitmapImg]);
+    gl.enable(gl.SCISSOR_TEST);
 
-  if (useBitmapImg && bitmapFallbackUrl) {
+    for (const row of effectiveRows) {
+      const mat = row.matrix;
+      if (!mat || mat.numTimeBins <= 0 || mat.numFreqBins <= 0 || row.heightPx <= 0) continue;
+
+      let tex = texByMatrix.get(mat);
+      gl.activeTexture(gl.TEXTURE0);
+      if (!tex) {
+        tex = gl.createTexture()!;
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        const uploadMat =
+          mat.numTimeBins > maxTex ? downsampleSpectrogramTime(mat, maxTex) : mat;
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.R32F,
+          uploadMat.numFreqBins,
+          uploadMat.numTimeBins,
+          0,
+          gl.RED,
+          gl.FLOAT,
+          uploadMat.data,
+        );
+        texByMatrix.set(mat, tex);
+      } else {
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+      }
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+
+      const totalTime = Math.max(1e-6, mat.endSec - mat.startSec);
+      const totalFreq = Math.max(1e-6, mat.maxFreqHz - mat.minFreqHz);
+      const t0 = (row.viewRange.startSec - mat.startSec) / totalTime;
+      const t1 = (row.viewRange.endSec - mat.startSec) / totalTime;
+      const f0 = (row.viewRange.minFreqHz - mat.minFreqHz) / totalFreq;
+      const f1 = (row.viewRange.maxFreqHz - mat.minFreqHz) / totalFreq;
+
+      // WebGL Y is bottom-up
+      const vyTop = pxH - Math.round(row.topPx * scaleY);
+      const vyBot = pxH - Math.round((row.topPx + row.heightPx) * scaleY);
+      const rh = Math.max(1, vyTop - vyBot);
+
+      gl.viewport(0, vyBot, pxW, rh);
+      gl.scissor(0, vyBot, pxW, rh);
+      gl.uniform2f(res.uTime, t0, t1);
+      gl.uniform2f(res.uFreq, f0, f1);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+
+    gl.disable(gl.SCISSOR_TEST);
+  }, [effectiveRows, displaySettings, width, height, useBitmapImg]);
+
+  if (useBitmapImg) {
     return (
-      <img
-        src={bitmapFallbackUrl}
-        alt="Spectrogram bitmap"
-        draggable={false}
+      <div
         style={{
+          position: 'relative',
           width: `${width}px`,
           height: `${height}px`,
-          display: 'block',
-          imageRendering: displaySettings.interpolation === 'nearest' ? 'pixelated' : 'auto',
-          userSelect: 'none',
+          background: '#0b0f14',
         }}
-      />
+      >
+        {effectiveRows.map((row) =>
+          row.bitmapFallbackUrl ? (
+            <img
+              key={row.key}
+              src={row.bitmapFallbackUrl}
+              alt="Spectrogram bitmap"
+              draggable={false}
+              style={{
+                position: 'absolute',
+                left: 0,
+                top: `${row.topPx}px`,
+                width: `${width}px`,
+                height: `${row.heightPx}px`,
+                display: 'block',
+                imageRendering: displaySettings.interpolation === 'nearest' ? 'pixelated' : 'auto',
+                userSelect: 'none',
+              }}
+            />
+          ) : null,
+        )}
+      </div>
     );
   }
 
