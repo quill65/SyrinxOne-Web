@@ -262,8 +262,8 @@ export const AiExplorerPanel: React.FC = () => {
         const prefix = typeof args.prefix === 'string' ? args.prefix : '';
         const limit =
           typeof args.limit === 'number' && Number.isFinite(args.limit)
-            ? Math.max(1, Math.min(300, Math.round(args.limit)))
-            : 120;
+            ? Math.max(1, Math.min(1000, Math.round(args.limit)))
+            : 500;
         const listed = await engine.browseSource(sourceId, prefix, limit);
         return {
           id: tc.id,
@@ -272,7 +272,7 @@ export const AiExplorerPanel: React.FC = () => {
             sourceId,
             prefix,
             totalReturned: listed.length,
-            entries: listed.slice(0, 120),
+            entries: listed.slice(0, limit),
           },
         };
       }
@@ -280,38 +280,77 @@ export const AiExplorerPanel: React.FC = () => {
       if (tc.name === 'inspect_recording_region') {
         const fid = String(args.fileId || activeFile?.fileId || '');
         const fInfo = resolveFileInfo(fid);
-        const maxDur = fInfo?.durationSec ?? Math.max(0.01, Number(args.endSec ?? 60));
+        const totalDur =
+          fInfo?.totalDurationSec ?? fInfo?.durationSec ?? Math.max(0.01, Number(args.endSec ?? 60));
         const nyquist = fInfo ? fInfo.sampleRate / 2 : 128000;
         const ch =
           typeof args.channel === 'number'
             ? Math.max(0, Math.min((fInfo?.numChannels ?? 1) - 1, Math.round(args.channel)))
             : defaultSpecParams.channel;
-        const startSec = Math.max(0, Math.min(maxDur - 0.005, Number(args.startSec ?? 0)));
-        const endSec = Math.max(startSec + 0.005, Math.min(maxDur, Number(args.endSec ?? maxDur)));
+        const startSec = Math.max(0, Math.min(totalDur - 0.005, Number(args.startSec ?? 0)));
+        const endSec = Math.max(startSec + 0.005, Math.min(totalDur, Number(args.endSec ?? totalDur)));
         const lowFreqHz = Math.max(0, Math.min(nyquist - 1, Number(args.lowFreqHz ?? 0)));
         const highFreqHz = Math.max(
           lowFreqHz + 1,
           Math.min(nyquist, Number(args.highFreqHz ?? nyquist)),
         );
 
-        const meas = await engine.measureSelection(fid, {
+        let targetFid = fid;
+        let targetInfo = fInfo;
+        let relStart = startSec;
+        let relEnd = endSec;
+        const winOff = fInfo?.windowStartSec ?? 0;
+
+        if (fInfo && !isCombinedFileId(fid) && fInfo.isPartialWindow) {
+          if (startSec >= winOff && endSec <= winOff + fInfo.durationSec) {
+            relStart = startSec - winOff;
+            relEnd = endSec - winOff;
+          } else {
+            const sliceDur = Math.max(5, Math.min(600, endSec - startSec));
+            const opened = await engine.openAudio(fInfo.sourceId, fInfo.uri, {
+              startSec,
+              maxDurationSec: sliceDur,
+            });
+            inspectedFilesRef.current[opened.fileId] = opened;
+            targetFid = opened.fileId;
+            targetInfo = opened;
+            relStart = Math.max(0, startSec - (opened.windowStartSec ?? startSec));
+            relEnd = Math.min(opened.durationSec, relStart + (endSec - startSec));
+          }
+        }
+
+        const span = relEnd - relStart;
+        const isWideSparse = isCombinedFileId(targetFid) && span > 1800;
+
+        const meas = await engine.measureSelection(targetFid, {
           channel: ch,
-          startSec,
-          endSec,
+          startSec: relStart,
+          endSec: relEnd,
           lowFreqHz,
           highFreqHz,
           fftSize: defaultSpecParams.fftSize,
           hopSize: defaultSpecParams.hopSize,
         });
 
+        let sparseMatrix: SpectrogramMatrix | undefined;
+        if (isWideSparse && targetInfo) {
+          sparseMatrix = await fetchSpectrogramAdaptive(
+            engine,
+            targetInfo,
+            { ...defaultSpecParams, channel: ch },
+            { startSec: relStart, endSec: relEnd, minFreqHz: lowFreqHz, maxFreqHz: highFreqHz },
+          ).catch(() => undefined);
+        }
+
         let imageBase64: string | undefined;
         if (args.includeImage !== false && includeSpecImg) {
           imageBase64 = await captureSpectrogramPngBase64(
             engine,
-            fInfo,
+            targetInfo,
             { ...defaultSpecParams, channel: ch },
             defaultDisplay,
-            { startSec, endSec, minFreqHz: lowFreqHz, maxFreqHz: highFreqHz },
+            { startSec: relStart, endSec: relEnd, minFreqHz: lowFreqHz, maxFreqHz: highFreqHz },
+            sparseMatrix,
           );
         }
 
@@ -319,14 +358,18 @@ export const AiExplorerPanel: React.FC = () => {
           id: tc.id,
           name: tc.name,
           response: {
-            fileId: fid,
-            fileName: fInfo?.name,
+            fileId: targetFid,
+            fileName: targetInfo?.name,
             channel: ch,
+            accessMode: isWideSparse ? 'sparse_spectral_sampling' : 'dense_dsp',
             region: { startSec, endSec, lowFreqHz, highFreqHz },
             measurements: meas,
+            ...(sparseMatrix
+              ? { spectrogramSummary: summarizeSpectrogramMatrix(sparseMatrix) }
+              : {}),
           },
           imageBase64,
-          imageLabel: `Spectrogram PNG for ${fInfo?.name ?? fid} [ch${ch}, ${startSec.toFixed(2)}–${endSec.toFixed(2)}s, ${Math.round(lowFreqHz)}–${Math.round(highFreqHz)} Hz]`,
+          imageLabel: `Spectrogram PNG for ${targetInfo?.name ?? targetFid} [ch${ch}, ${startSec.toFixed(2)}–${endSec.toFixed(2)}s, ${Math.round(lowFreqHz)}–${Math.round(highFreqHz)} Hz]`,
         };
       }
 
@@ -577,6 +620,7 @@ export const AiExplorerPanel: React.FC = () => {
 
         const siblingPrefix = parentDirectoryUri(activeFile.uri);
 
+        const skipExtraFullMeasure = isCombinedFileId(activeFile.fileId) && activeFile.durationSec > 3600;
         const [
           focusedImgRes,
           fullImgRes,
@@ -595,7 +639,7 @@ export const AiExplorerPanel: React.FC = () => {
                 activeMatrix,
               )
             : Promise.resolve(undefined),
-          includeSpecImg && needSeparateFull
+          includeSpecImg && needSeparateFull && (!skipExtraFullMeasure || Boolean(activeMatrix))
             ? captureSpectrogramPngBase64(
                 engine,
                 activeFile,
@@ -605,7 +649,7 @@ export const AiExplorerPanel: React.FC = () => {
                 activeMatrix,
               )
             : Promise.resolve(undefined),
-          needSeparateFull
+          needSeparateFull && !skipExtraFullMeasure
             ? engine
                 .measureSelection(activeFile.fileId, {
                   channel: activeWin.specParams.channel,
@@ -622,26 +666,28 @@ export const AiExplorerPanel: React.FC = () => {
             ? engine.listSources().catch(() => [] as DataSourceInfo[])
             : Promise.resolve([] as DataSourceInfo[]),
           includeSourceContext && activeFile.sourceId !== 'upload'
-            ? engine.browseSource(activeFile.sourceId, siblingPrefix, 250).catch(() => [])
+            ? engine.browseSource(activeFile.sourceId, siblingPrefix, 1000).catch(() => [])
             : Promise.resolve([]),
-          Promise.all(
-            otherChannels.map(async (ch) => {
-              try {
-                const m = await engine.measureSelection(activeFile.fileId, {
-                  channel: ch,
-                  startSec: 0,
-                  endSec: activeFile.durationSec,
-                  lowFreqHz: 0,
-                  highFreqHz: nyquist,
-                  fftSize: activeWin.specParams.fftSize,
-                  hopSize: activeWin.specParams.hopSize,
-                });
-                return { channel: ch, measurements: m };
-              } catch {
-                return null;
-              }
-            }),
-          ),
+          skipExtraFullMeasure
+            ? Promise.resolve([])
+            : Promise.all(
+                otherChannels.map(async (ch) => {
+                  try {
+                    const m = await engine.measureSelection(activeFile.fileId, {
+                      channel: ch,
+                      startSec: 0,
+                      endSec: activeFile.durationSec,
+                      lowFreqHz: 0,
+                      highFreqHz: nyquist,
+                      fftSize: activeWin.specParams.fftSize,
+                      hopSize: activeWin.specParams.hopSize,
+                    });
+                    return { channel: ch, measurements: m };
+                  } catch {
+                    return null;
+                  }
+                }),
+              ),
         ]);
 
         const activeSource = sourcesRes.find((s) => s.sourceId === activeFile.sourceId) ?? null;

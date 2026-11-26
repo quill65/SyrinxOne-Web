@@ -29,6 +29,11 @@ import {
   getSmartArchiveWindowSec,
   MAX_WEBGL_TIME_BINS,
 } from './spectrogramFetch';
+import {
+  fetchSparseSpectrogram,
+  fetchSparseWaveform,
+  shouldUseSparseSpectrogram,
+} from './sparseSpectrogram';
 import { parseTimestampFromName } from './timeFormat';
 
 function inferIsoFromSpec(name: string, folderName?: string): string | null {
@@ -327,8 +332,14 @@ export class CombinedEngineProxy implements AudioEngineClient {
   ): AudioFileInfo | undefined {
     const rec = this.combinedMap.get(fileId);
     if (!rec) return undefined;
-    const safeMax = getSafeMaxWindowSec(rec.sampleRate, rec.numChannels);
     const reqLen = maxDurationSec ?? rec.windowDurationSec;
+    if (reqLen >= rec.totalDurationSec - 0.5) {
+      rec.isPartialWindow = false;
+      rec.windowStartSec = 0;
+      rec.windowDurationSec = rec.totalDurationSec;
+      return this.toAudioFileInfo(rec);
+    }
+    const safeMax = getSafeMaxWindowSec(rec.sampleRate, rec.numChannels);
     const nextLen = Math.max(5, Math.min(rec.totalDurationSec, safeMax, Math.round(reqLen)));
     const nextStart = Math.max(0, Math.min(Math.max(0, rec.totalDurationSec - nextLen), startSec));
     rec.isPartialWindow = nextLen < rec.totalDurationSec - 0.5;
@@ -337,26 +348,116 @@ export class CombinedEngineProxy implements AudioEngineClient {
     return this.toAudioFileInfo(rec);
   }
 
+  public async openCompleteAudio(
+    sourceId: string,
+    uri: string,
+    recordingKey: string,
+    options?: {
+      startSec?: number;
+      maxDurationSec?: number;
+      fullTimeline?: boolean;
+      sizeBytes?: number;
+      name?: string;
+    },
+  ): Promise<AudioFileInfo> {
+    const smartWin = getSmartArchiveWindowSec(options?.name ?? uri, options?.sizeBytes);
+    const wantsFull = options?.fullTimeline !== false && options?.maxDurationSec === undefined;
+    const openOpts = wantsFull
+      ? smartWin !== undefined
+        ? { startSec: 0, maxDurationSec: 1 }
+        : undefined
+      : options?.startSec !== undefined || options?.maxDurationSec !== undefined
+        ? {
+            ...(options.startSec !== undefined ? { startSec: options.startSec } : {}),
+            ...(options.maxDurationSec !== undefined ? { maxDurationSec: options.maxDurationSec } : {}),
+          }
+        : undefined;
+
+    const info = await this.inner.openAudio(sourceId, uri, openOpts);
+    const totalDur = Math.max(0.05, info.totalDurationSec ?? info.durationSec);
+    const safeMax = getSafeMaxWindowSec(info.sampleRate, info.numChannels);
+
+    // Small file that loaded completely in one call: return directly
+    if (!info.isPartialWindow && totalDur <= safeMax) {
+      return info;
+    }
+
+    // Explicit partial slice requested and user opted out of full timeline
+    if (!wantsFull && info.isPartialWindow) {
+      return info;
+    }
+
+    // Wrap large archive file as a single-segment Random-Access Complete Recording
+    const seg: CombinedSegment = {
+      index: 0,
+      sourceId,
+      uri,
+      name: info.name,
+      sizeBytes: options?.sizeBytes,
+      durationSec: totalDur,
+      probed: true,
+      sampleRate: info.sampleRate,
+      numChannels: info.numChannels,
+      format: info.format,
+      subtype: info.subtype,
+      startDateTimeIso: info.startDateTimeIso ?? inferIsoFromSpec(info.name),
+      timelineStartSec: 0,
+      timelineEndSec: totalDur,
+    };
+
+    const combinedId = `combined::${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const rec: CombinedRecording = {
+      combinedId,
+      recordingKey,
+      title: info.name,
+      sourceId,
+      uri,
+      sampleRate: info.sampleRate,
+      numChannels: info.numChannels,
+      format: info.format,
+      subtype: info.subtype,
+      startDateTimeIso: seg.startDateTimeIso,
+      segments: [seg],
+      totalDurationSec: totalDur,
+      windowStartSec: 0,
+      windowDurationSec: totalDur,
+      isPartialWindow: false,
+      openSlices: new Map(),
+    };
+    const sliceStart = info.windowStartSec ?? 0;
+    rec.openSlices.set(0, {
+      fileInfo: info,
+      sliceStartSec: sliceStart,
+      sliceEndSec: sliceStart + info.durationSec,
+      lastUsedAt: Date.now(),
+    });
+
+    this.combinedMap.set(combinedId, rec);
+    return this.toAudioFileInfo(rec);
+  }
+
   public async openCombinedArchive(
     specs: SegmentSourceSpec[],
     title: string,
     recordingKey: string,
-    options?: { startSec?: number; maxDurationSec?: number },
+    options?: { startSec?: number; maxDurationSec?: number; fullTimeline?: boolean },
   ): Promise<AudioFileInfo> {
     if (specs.length === 0) {
       throw new Error('No audio segments selected to combine.');
     }
     if (specs.length === 1) {
-      return this.inner.openAudio(specs[0].sourceId, specs[0].uri, options);
+      return this.openCompleteAudio(specs[0].sourceId, specs[0].uri, recordingKey, {
+        ...options,
+        sizeBytes: specs[0].sizeBytes,
+        name: specs[0].name,
+      });
     }
 
-    // Probe segment 0 quickly (smart window cap so multi-hour files open cleanly)
+    // Probe segment 0 with a minimal 1s slice for large files to minimize startup I/O
     const firstSpec = specs[0];
     const smartFirstMax = getSmartArchiveWindowSec(firstSpec.name, firstSpec.sizeBytes);
     const firstProbeOpt =
-      smartFirstMax !== undefined
-        ? { startSec: 0, maxDurationSec: Math.min(300, smartFirstMax) }
-        : undefined;
+      smartFirstMax !== undefined ? { startSec: 0, maxDurationSec: 1 } : undefined;
     const firstInfo = await this.inner.openAudio(firstSpec.sourceId, firstSpec.uri, firstProbeOpt);
     const firstTotalDur = Math.max(0.05, firstInfo.totalDurationSec ?? firstInfo.durationSec);
     const bps = bytesPerSampleFromSubtype(firstInfo.subtype);
@@ -397,7 +498,6 @@ export class CombinedEngineProxy implements AudioEngineClient {
     });
 
     const combinedId = `combined::${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    const totalBytesEst = specs.reduce((acc, s) => acc + (s.sizeBytes ?? 0), 0);
     const resolvedStartIso =
       firstInfo.startDateTimeIso ?? inferIsoFromSpec(firstSpec.name, firstSpec.folderName);
 
@@ -430,20 +530,26 @@ export class CombinedEngineProxy implements AudioEngineClient {
       lastUsedAt: Date.now(),
     });
 
-    const safeMax = getSafeMaxWindowSec(rec.sampleRate, rec.numChannels);
-    const defaultWindowDur =
-      options?.maxDurationSec ??
-      (rec.totalDurationSec <= Math.min(safeMax, 3600) && (totalBytesEst === 0 || totalBytesEst <= 65 * 1024 * 1024)
-        ? rec.totalDurationSec
-        : Math.min(rec.totalDurationSec, safeMax, getSmartArchiveWindowSec(firstSpec.name, Math.max(totalBytesEst, 25 * 1024 * 1024)) ?? 900));
-
-    const winLen = Math.max(5, Math.min(rec.totalDurationSec, safeMax, Math.round(defaultWindowDur)));
-    const isPartial = winLen < rec.totalDurationSec - 0.5;
-    rec.isPartialWindow = isPartial;
-    rec.windowDurationSec = winLen;
-    rec.windowStartSec = isPartial
-      ? Math.max(0, Math.min(Math.max(0, rec.totalDurationSec - winLen), options?.startSec ?? 0))
-      : 0;
+    const explicitPartial =
+      options?.fullTimeline === false && options?.maxDurationSec !== undefined;
+    if (explicitPartial) {
+      const safeMax = getSafeMaxWindowSec(rec.sampleRate, rec.numChannels);
+      const winLen = Math.max(
+        5,
+        Math.min(rec.totalDurationSec, safeMax, Math.round(options.maxDurationSec!)),
+      );
+      const isPartial = winLen < rec.totalDurationSec - 0.5;
+      rec.isPartialWindow = isPartial;
+      rec.windowDurationSec = winLen;
+      rec.windowStartSec = isPartial
+        ? Math.max(0, Math.min(Math.max(0, rec.totalDurationSec - winLen), options?.startSec ?? 0))
+        : 0;
+    } else {
+      // Complete-Recording random-access mode: view & address 0 .. totalDurationSec via sparse reads
+      rec.isPartialWindow = false;
+      rec.windowDurationSec = rec.totalDurationSec;
+      rec.windowStartSec = 0;
+    }
 
     this.combinedMap.set(combinedId, rec);
     return this.toAudioFileInfo(rec);
@@ -597,6 +703,11 @@ export class CombinedEngineProxy implements AudioEngineClient {
     fileId: string,
     params: SpectrogramParams,
     range?: { startSec?: number; endSec?: number; minFreqHz?: number; maxFreqHz?: number },
+    sparseOpts?: {
+      targetBins?: number;
+      onProgress?: (partial: SpectrogramMatrix) => void;
+      signal?: AbortSignal;
+    },
   ): Promise<SpectrogramMatrix> {
     const rec = this.combinedMap.get(fileId);
     if (!rec) {
@@ -613,6 +724,64 @@ export class CombinedEngineProxy implements AudioEngineClient {
     const overlaps = this.resolveOverlappingSegments(rec, relStart, relEnd);
     if (overlaps.length === 0) {
       throw new Error('Requested spectrogram range falls outside combined recording bounds.');
+    }
+
+    if (
+      shouldUseSparseSpectrogram(
+        spanSec,
+        rec.sampleRate,
+        rec.numChannels,
+        params.fftSize,
+        overlaps.length,
+      )
+    ) {
+      const winOff = rec.windowStartSec;
+      const mat = await fetchSparseSpectrogram(
+        this.inner,
+        fileId,
+        rec.segments,
+        params,
+        rec.sampleRate,
+        {
+          startSec: winOff + relStart,
+          endSec: winOff + relEnd,
+          minFreqHz,
+          maxFreqHz,
+        },
+        {
+          targetSamples: sparseOpts?.targetBins ?? (spanSec > 43200 ? 128 : 96),
+          signal: sparseOpts?.signal,
+          onProgress: sparseOpts?.onProgress
+            ? (partial) =>
+                sparseOpts.onProgress?.({
+                  ...partial,
+                  startSec: Math.max(0, partial.startSec - winOff),
+                  endSec: Math.max(0.01, partial.endSec - winOff),
+                })
+            : undefined,
+          onSegmentProbed: (segIdx, exactDur, opened) => {
+            const seg = rec.segments[segIdx];
+            if (!seg) return;
+            if (!seg.probed || Math.abs(exactDur - seg.durationSec) > 0.5) {
+              seg.probed = true;
+              seg.durationSec = exactDur;
+              seg.sampleRate = opened.sampleRate;
+              seg.numChannels = opened.numChannels;
+              if (opened.startDateTimeIso) {
+                seg.startDateTimeIso = opened.startDateTimeIso;
+                if (segIdx === 0) rec.startDateTimeIso = opened.startDateTimeIso;
+              }
+              recomputeTimelines(rec);
+              this.onDurationUpdatedCallback?.(this.toAudioFileInfo(rec));
+            }
+          },
+        },
+      );
+      return {
+        ...mat,
+        startSec: relStart,
+        endSec: relEnd,
+      };
     }
 
     const matrices: SpectrogramMatrix[] = [];
@@ -720,6 +889,28 @@ export class CombinedEngineProxy implements AudioEngineClient {
     const span = relEnd - relStart;
     const overlaps = this.resolveOverlappingSegments(rec, relStart, relEnd);
 
+    if (
+      overlaps.length > 4 ||
+      shouldUseSparseSpectrogram(span, rec.sampleRate, rec.numChannels, 512, overlaps.length)
+    ) {
+      const winOff = rec.windowStartSec;
+      const wf = await fetchSparseWaveform(
+        this.inner,
+        fileId,
+        rec.segments,
+        channel,
+        numBins,
+        winOff + relStart,
+        winOff + relEnd,
+        32,
+      );
+      return {
+        ...wf,
+        startSec: relStart,
+        endSec: relEnd,
+      };
+    }
+
     const minValues: number[] = [];
     const maxValues: number[] = [];
 
@@ -757,6 +948,101 @@ export class CombinedEngineProxy implements AudioEngineClient {
     const overlaps = this.resolveOverlappingSegments(rec, req.startSec, req.endSec);
     if (overlaps.length === 0) {
       throw new Error('Selection falls outside loaded combined recording bounds.');
+    }
+
+    const selSpan = Math.max(0.01, req.endSec - req.startSec);
+    if (selSpan > getSafeMaxWindowSec(rec.sampleRate, rec.numChannels) || overlaps.length > 6) {
+      const mat = await this.getSpectrogram(
+        fileId,
+        {
+          channel: req.channel,
+          fftSize: req.fftSize ?? 512,
+          hopSize: req.fftSize ?? 512,
+          windowType: 'hann',
+          dspMode: 'modern_stft',
+          popFilter: false,
+          classicGain: 1,
+          classicWhiteThresh: 0,
+        },
+        {
+          startSec: req.startSec,
+          endSec: req.endSec,
+          minFreqHz: req.lowFreqHz,
+          maxFreqHz: req.highFreqHz,
+        },
+        { targetBins: 24 },
+      );
+
+      let peakDb = -Infinity;
+      let peakFreqHz = (req.lowFreqHz + req.highFreqHz) * 0.5;
+      let timeOfPeakSec = req.startSec + selSpan * 0.5;
+      const freqTotals = new Float64Array(mat.numFreqBins);
+      const dbValues: number[] = [];
+      let linearSum = 0;
+      let cellCount = 0;
+
+      for (let t = 0; t < mat.numTimeBins; t++) {
+        for (let f = 0; f < mat.numFreqBins; f++) {
+          const valDb = mat.data[t * mat.numFreqBins + f];
+          if (!Number.isFinite(valDb)) continue;
+          const lin = Math.pow(10, valDb / 10);
+          freqTotals[f] += lin;
+          linearSum += lin;
+          cellCount++;
+          dbValues.push(valDb);
+          if (valDb > peakDb) {
+            peakDb = valDb;
+            peakFreqHz = mat.minFreqHz + f * mat.freqStepHz;
+            timeOfPeakSec = mat.startSec + (t + 0.5) * mat.timeStepSec;
+          }
+        }
+      }
+
+      dbValues.sort((a, b) => a - b);
+      const noiseFloorDb =
+        dbValues.length > 0 ? dbValues[Math.floor(dbValues.length * 0.35)] : -80;
+      const rmsDb = cellCount > 0 && linearSum > 0 ? 10 * Math.log10(linearSum / cellCount) : noiseFloorDb;
+      if (!Number.isFinite(peakDb)) peakDb = rmsDb;
+
+      let weightedFreqSum = 0;
+      let totalPower = 0;
+      for (let f = 0; f < mat.numFreqBins; f++) {
+        const hz = mat.minFreqHz + f * mat.freqStepHz;
+        weightedFreqSum += hz * freqTotals[f];
+        totalPower += freqTotals[f];
+      }
+      const centroidFreqHz = totalPower > 0 ? weightedFreqSum / totalPower : peakFreqHz;
+      const findQuantileFreq = (q: number): number => {
+        if (totalPower <= 0) return centroidFreqHz;
+        let acc = 0;
+        const target = totalPower * q;
+        for (let f = 0; f < mat.numFreqBins; f++) {
+          acc += freqTotals[f];
+          if (acc >= target) return mat.minFreqHz + f * mat.freqStepHz;
+        }
+        return mat.maxFreqHz;
+      };
+      const q5FreqHz = findQuantileFreq(0.05);
+      const q50FreqHz = findQuantileFreq(0.5);
+      const q95FreqHz = findQuantileFreq(0.95);
+
+      return {
+        durationSec: selSpan,
+        lowFreqHz: req.lowFreqHz,
+        highFreqHz: req.highFreqHz,
+        bandwidthHz: Math.max(0, req.highFreqHz - req.lowFreqHz),
+        peakFreqHz,
+        centroidFreqHz,
+        q5FreqHz,
+        q50FreqHz,
+        q95FreqHz,
+        bw90Hz: Math.max(0, q95FreqHz - q5FreqHz),
+        timeOfPeakSec,
+        rmsDb,
+        peakDb,
+        noiseFloorDb,
+        snrDb: peakDb - noiseFloorDb,
+      };
     }
 
     const parts: Array<{ m: SelectionMeasurements; winBaseSec: number }> = [];
@@ -833,6 +1119,13 @@ export class CombinedEngineProxy implements AudioEngineClient {
     const scanStart = Math.max(0, req.startSec ?? 0);
     const scanEnd = Math.min(activeDur, req.endSec ?? activeDur);
     const overlaps = this.resolveOverlappingSegments(rec, scanStart, scanEnd);
+
+    const safeMax = getSafeMaxWindowSec(rec.sampleRate, rec.numChannels);
+    if (scanEnd - scanStart > safeMax || overlaps.length > 16) {
+      throw new Error(
+        `Exhaustive Detect Sounds spans too much audio (${overlaps.length} segments). Zoom or select a region within ${Math.round(safeMax / 60)} min first.`,
+      );
+    }
 
     const allDetections: AnnotationRecord[] = [];
     const savedClips: string[] = [];

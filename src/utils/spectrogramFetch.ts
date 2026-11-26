@@ -120,12 +120,34 @@ export async function fetchSpectrogramAdaptive(
   params: SpectrogramParams,
   range?: { startSec?: number; endSec?: number; minFreqHz?: number; maxFreqHz?: number },
   targetMaxTimeBins = MAX_WEBGL_TIME_BINS,
+  sparseOpts?: {
+    targetBins?: number;
+    onProgress?: (partial: SpectrogramMatrix) => void;
+    signal?: AbortSignal;
+  },
 ): Promise<SpectrogramMatrix> {
   const startSec = Math.max(0, range?.startSec ?? 0);
   const endSec = Math.max(startSec + 0.01, Math.min(file.durationSec, range?.endSec ?? file.durationSec));
   const spanSec = endSec - startSec;
   const minFreqHz = range?.minFreqHz;
   const maxFreqHz = range?.maxFreqHz;
+
+  const safeMax = getSafeMaxWindowSec(file.sampleRate, file.numChannels);
+  if (file.fileId.startsWith('combined::') && spanSec > Math.min(safeMax, 1800)) {
+    const getSpecFn = engine.getSpectrogram as (
+      fid: string,
+      p: SpectrogramParams,
+      r?: { startSec?: number; endSec?: number; minFreqHz?: number; maxFreqHz?: number },
+      opts?: typeof sparseOpts,
+    ) => Promise<SpectrogramMatrix>;
+    return getSpecFn.call(
+      engine,
+      file.fileId,
+      params,
+      { startSec, endSec, minFreqHz, maxFreqHz },
+      sparseOpts,
+    );
+  }
 
   // Engine clamps hopSize <= fftSize. When viewing very long spans (> targetMaxTimeBins),
   // bump hopSize up to fftSize if the output pixels are coarser anyway to minimize HTTP traffic.

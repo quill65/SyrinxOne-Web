@@ -26,6 +26,7 @@ import {
 import type { GoogleUserProfile } from '../auth/googleAuth';
 import { applyMdiLayout, type CanvasBounds } from '../utils/mdiLayout';
 import {
+  MAX_WEBGL_TIME_BINS,
   computeNormalizedGainDb,
   fetchSpectrogramAdaptive,
   formatDurationCompact,
@@ -46,6 +47,7 @@ import {
   type SavedRecordingViewState,
   type SegmentSourceSpec,
 } from '../utils/contiguousArchive';
+import type { ArchiveTargetInput } from '../utils/archiveDocs';
 
 const HOTKEYS_STORAGE_KEY = 'syrinxone.hotkeys.v1';
 const DEFAULTS_STORAGE_KEY = 'syrinxone.windowDefaults.v1';
@@ -180,6 +182,16 @@ function sanitizeDisplaySettings(raw?: Partial<DisplaySettings>): DisplaySetting
   };
 }
 
+function sanitizeSpecParams(raw?: Partial<SpectrogramParams>): SpectrogramParams {
+  return {
+    ...DEFAULT_SPECTROGRAM_PARAMS,
+    ...(raw ?? {}),
+    dspMode: 'modern_stft',
+    classicGain: 1,
+    classicWhiteThresh: 0,
+  };
+}
+
 function loadSavedDefaults(): {
   specParams: SpectrogramParams;
   displaySettings: DisplaySettings;
@@ -195,7 +207,7 @@ function loadSavedDefaults(): {
       };
       const autoGainMode = normalizeAutoGainMode(parsed.autoGainMode);
       return {
-        specParams: { ...DEFAULT_SPECTROGRAM_PARAMS, ...(parsed.specParams ?? {}) },
+        specParams: sanitizeSpecParams(parsed.specParams),
         displaySettings: sanitizeDisplaySettings(parsed.displaySettings),
         autoGainMode,
       };
@@ -204,7 +216,7 @@ function loadSavedDefaults(): {
     // ignore
   }
   return {
-    specParams: { ...DEFAULT_SPECTROGRAM_PARAMS },
+    specParams: sanitizeSpecParams(),
     displaySettings: { ...DEFAULT_DISPLAY_SETTINGS },
     autoGainMode: 'manual',
   };
@@ -283,8 +295,11 @@ export interface WorkspaceStore {
   showHotkeyModal: boolean;
   showKlipModal: boolean;
   showDetectModal: boolean;
+  showArchiveAboutModal: boolean;
+  aboutArchiveTarget: ArchiveTargetInput | null;
   sourceReturnToBrowser: boolean;
   openSourceSelector: (returnToBrowser?: boolean) => void;
+  openAboutArchive: (target: ArchiveTargetInput) => void;
   suggestedDetectParams: SuggestedDetectParams | null;
 
   googleUser: GoogleUserProfile | null;
@@ -301,7 +316,14 @@ export interface WorkspaceStore {
   openAudioFromSource: (
     sourceId: string,
     uri: string,
-    options?: { startSec?: number; maxDurationSec?: number; restoreSaved?: boolean },
+    options?: {
+      startSec?: number;
+      maxDurationSec?: number;
+      fullTimeline?: boolean;
+      sizeBytes?: number;
+      name?: string;
+      restoreSaved?: boolean;
+    },
   ) => Promise<void>;
   openCombinedArchive: (
     specs: SegmentSourceSpec[],
@@ -309,6 +331,7 @@ export interface WorkspaceStore {
     options?: {
       startSec?: number;
       maxDurationSec?: number;
+      fullTimeline?: boolean;
       recordingKey?: string;
       restoreSaved?: boolean;
     },
@@ -417,7 +440,8 @@ export interface WorkspaceStore {
       | 'showFileBrowser'
       | 'showHotkeyModal'
       | 'showKlipModal'
-      | 'showDetectModal',
+      | 'showDetectModal'
+      | 'showArchiveAboutModal',
     value: boolean,
   ) => void;
 }
@@ -576,6 +600,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
   showHotkeyModal: false,
   showKlipModal: false,
   showDetectModal: false,
+  showArchiveAboutModal: false,
+  aboutArchiveTarget: null,
   sourceReturnToBrowser: false,
   openSourceSelector: (returnToBrowser = false) =>
     set({
@@ -583,6 +609,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
       showFileBrowser: false,
       sourceReturnToBrowser: returnToBrowser,
     }),
+  openAboutArchive: (target) =>
+    set({ aboutArchiveTarget: target, showArchiveAboutModal: true }),
   suggestedDetectParams: null,
 
   googleUser: null,
@@ -634,25 +662,37 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
         options?.maxDurationSec === undefined
           ? getRecordingViewState(recKey)
           : null;
-      const openOpts =
-        saved && (saved.windowStartSec > 0 || saved.windowDurationSec !== undefined)
-          ? {
-              startSec: saved.windowStartSec,
-              ...(saved.windowDurationSec !== undefined
-                ? { maxDurationSec: saved.windowDurationSec }
-                : {}),
-            }
-          : options
-            ? {
-                ...(options.startSec !== undefined ? { startSec: options.startSec } : {}),
-                ...(options.maxDurationSec !== undefined
-                  ? { maxDurationSec: options.maxDurationSec }
-                  : {}),
-              }
-            : undefined;
+      const savedIsPartial =
+        saved &&
+        saved.totalDurationSec !== undefined &&
+        saved.windowDurationSec !== undefined &&
+        saved.windowDurationSec < saved.totalDurationSec - 0.5;
+      const useSavedSlice =
+        saved &&
+        (saved.windowStartSec > 0 || savedIsPartial) &&
+        options?.fullTimeline !== true;
+      const openOpts = useSavedSlice
+        ? {
+            startSec: saved.windowStartSec,
+            ...(saved.windowDurationSec !== undefined
+              ? { maxDurationSec: saved.windowDurationSec }
+              : {}),
+            fullTimeline: false,
+            sizeBytes: options?.sizeBytes,
+            name: options?.name,
+          }
+        : {
+            ...(options?.startSec !== undefined ? { startSec: options.startSec } : {}),
+            ...(options?.maxDurationSec !== undefined
+              ? { maxDurationSec: options.maxDurationSec }
+              : {}),
+            fullTimeline: options?.fullTimeline ?? options?.maxDurationSec === undefined,
+            sizeBytes: options?.sizeBytes,
+            name: options?.name,
+          };
 
       set({ statusMessage: `Opening ${uri}...`, errorMessage: null });
-      const info = await get().engine.openAudio(sourceId, uri, openOpts);
+      const info = await get().engine.openCompleteAudio(sourceId, uri, recKey, openOpts);
       await get().openAudioInfoInWindow(info, {
         recordingKey: recKey,
         restoreState: options?.restoreSaved !== false ? (saved ?? getRecordingViewState(recKey)) : null,
@@ -670,6 +710,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
       await get().openAudioFromSource(specs[0].sourceId, specs[0].uri, {
         startSec: options?.startSec,
         maxDurationSec: options?.maxDurationSec,
+        fullTimeline: options?.fullTimeline,
+        sizeBytes: specs[0].sizeBytes,
+        name: specs[0].name,
         restoreSaved: options?.restoreSaved,
       });
       return;
@@ -678,16 +721,24 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
       const recKey =
         options?.recordingKey ?? makeCombinedRecordingKey(specs[0].sourceId, specs);
       const saved = options?.restoreSaved !== false ? getRecordingViewState(recKey) : null;
+      const savedIsPartial =
+        saved &&
+        saved.totalDurationSec !== undefined &&
+        saved.windowDurationSec !== undefined &&
+        saved.windowDurationSec < saved.totalDurationSec - 0.5;
       const useSavedSlice =
         saved &&
         options?.startSec === undefined &&
-        options?.maxDurationSec === undefined;
+        options?.maxDurationSec === undefined &&
+        savedIsPartial &&
+        options?.fullTimeline !== true;
       const openOpts = useSavedSlice
         ? {
             startSec: saved.windowStartSec,
             ...(saved.windowDurationSec !== undefined
               ? { maxDurationSec: saved.windowDurationSec }
               : {}),
+            fullTimeline: false,
           }
         : options
           ? {
@@ -695,11 +746,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
               ...(options.maxDurationSec !== undefined
                 ? { maxDurationSec: options.maxDurationSec }
                 : {}),
+              ...(options.fullTimeline !== undefined
+                ? { fullTimeline: options.fullTimeline }
+                : {}),
             }
           : undefined;
 
       set({
-        statusMessage: `Combining ${specs.length} contiguous recordings (${title})...`,
+        statusMessage: `Indexing ${specs.length} contiguous recordings (${title})...`,
         errorMessage: null,
       });
       const info = await get().engine.openCombinedArchive(specs, title, recKey, openOpts);
@@ -804,8 +858,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     const totalDur = file.totalDurationSec ?? file.durationSec;
     const safeMax = getSafeMaxWindowSec(file.sampleRate, file.numChannels);
     const requestedLen = maxDurationSec ?? file.durationSec;
-    const nextLen = Math.max(5, Math.min(totalDur, safeMax, Math.round(requestedLen)));
-    const nextStart = Math.max(0, Math.min(Math.max(0, totalDur - nextLen), startSec));
+    const wantsFull = requestedLen >= totalDur - 0.5;
+    const nextLen = wantsFull
+      ? totalDur
+      : Math.max(5, Math.min(totalDur, safeMax, Math.round(requestedLen)));
+    const nextStart = wantsFull
+      ? 0
+      : Math.max(0, Math.min(Math.max(0, totalDur - nextLen), startSec));
 
     if (isCombinedFileId(file.fileId)) {
       const nextInfo = state.engine.setCombinedWindow(file.fileId, nextStart, nextLen);
@@ -919,14 +978,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
       ...(saved?.displaySettings ?? {}),
       lockSettings: false,
     });
-    const spec: SpectrogramParams = {
+    const spec: SpectrogramParams = sanitizeSpecParams({
       ...state.defaultSpecParams,
       ...(saved?.specParams ?? {}),
       channel: Math.min(
         saved?.channel ?? saved?.specParams?.channel ?? state.defaultSpecParams.channel,
         Math.max(0, info.numChannels - 1),
       ),
-    };
+    });
     const autoMode: AutoGainMode = normalizeAutoGainMode(
       saved?.autoGainMode ?? state.defaultAutoGainMode,
     );
@@ -1015,7 +1074,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
       minimized: false,
       selection: null,
       viewRange: { ...src.viewRange },
-      specParams: { ...src.specParams },
+      specParams: sanitizeSpecParams(src.specParams),
       displaySettings: { ...src.displaySettings },
     };
     const recKey = state.windowRecordingKeys[windowId];
@@ -1077,11 +1136,30 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     }
 
     try {
+      const isSparse = isCombinedFileId(file.fileId) && file.durationSec > 1800;
+      if (isSparse) {
+        set({
+          statusMessage: `Sampling sparse spectral lines across ${formatDurationCompact(file.durationSec)}...`,
+        });
+      }
       const fetched = await Promise.all(
         missing.map(async (ch) => {
           const chParams = { ...win.specParams, channel: ch };
           const key = makeSpecCacheKey(win.fileId, chParams);
-          const mat = await fetchSpectrogramAdaptive(state.engine, file, chParams);
+          const mat = await fetchSpectrogramAdaptive(
+            state.engine,
+            file,
+            chParams,
+            undefined,
+            MAX_WEBGL_TIME_BINS,
+            {
+              onProgress: (partialMat) => {
+                set((s) => ({
+                  spectrogramCache: { ...s.spectrogramCache, [key]: partialMat },
+                }));
+              },
+            },
+          );
           return { ch, key, mat };
         }),
       );
@@ -1090,7 +1168,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
         for (const item of fetched) {
           nextCache[item.key] = item.mat;
         }
-        return { spectrogramCache: nextCache };
+        return {
+          spectrogramCache: nextCache,
+          ...(isSparse
+            ? {
+                statusMessage: `Ready · Sparse view (${formatDurationCompact(file.durationSec)}) — zoom anywhere for full resolution`,
+              }
+            : {}),
+        };
       });
       const normMat =
         fetched.find((f) => f.ch === win.specParams.channel)?.mat ??
@@ -1307,7 +1392,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
   updateWindowSpecParams: async (windowId, patch) => {
     set((s) => ({
       windows: s.windows.map((w) =>
-        w.windowId === windowId ? { ...w, specParams: { ...w.specParams, ...patch } } : w,
+        w.windowId === windowId
+          ? { ...w, specParams: sanitizeSpecParams({ ...w.specParams, ...patch }) }
+          : w,
       ),
     }));
     schedulePersistView(get, windowId);
@@ -1468,7 +1555,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
         return {
           ...w,
           displaySettings: nextDisp,
-          specParams: { ...src.specParams, channel: safeChan },
+          specParams: sanitizeSpecParams({ ...src.specParams, channel: safeChan }),
           viewRange: nextRange,
         };
       });
@@ -1488,7 +1575,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     const state = get();
     const src = state.windows.find((w) => w.windowId === sourceWindowId);
     if (!src) return;
-    const specParams = { ...src.specParams };
+    const specParams = sanitizeSpecParams(src.specParams);
     const displaySettings = { ...src.displaySettings, lockSettings: false };
     const autoGainMode = state.windowAutoGainMode[sourceWindowId] ?? 'manual';
     try {
@@ -1608,7 +1695,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
       }
       if (parsed.defaultSpecParams || parsed.defaultDisplaySettings) {
         set((s) => ({
-          defaultSpecParams: { ...s.defaultSpecParams, ...(parsed.defaultSpecParams ?? {}) },
+          defaultSpecParams: sanitizeSpecParams({
+            ...s.defaultSpecParams,
+            ...(parsed.defaultSpecParams ?? {}),
+          }),
           defaultDisplaySettings: {
             ...s.defaultDisplaySettings,
             ...(parsed.defaultDisplaySettings ?? {}),
@@ -1636,7 +1726,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
             showTitlebar: savedWin.showTitlebar ?? true,
             linkGroupId: savedWin.linkGroupId ?? null,
             viewRange: savedWin.viewRange,
-            specParams: { ...DEFAULT_SPECTROGRAM_PARAMS, ...savedWin.specParams },
+            specParams: sanitizeSpecParams(savedWin.specParams),
             displaySettings: sanitizeDisplaySettings(savedWin.displaySettings),
             selection: null,
           };
@@ -1708,11 +1798,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     const file = state.files[win.fileId];
     if (!file) return null;
     const sel = win.selection;
+    const winOff = file.windowStartSec ?? 0;
     return state.addAnnotation({
       soundfile: file.name,
       channel: sel.channel,
-      startTimeSec: Math.min(sel.startSec, sel.endSec),
-      endTimeSec: Math.max(sel.startSec, sel.endSec),
+      startTimeSec: winOff + Math.min(sel.startSec, sel.endSec),
+      endTimeSec: winOff + Math.max(sel.startSec, sel.endSec),
       lowFreqHz: Math.min(sel.lowFreqHz, sel.highFreqHz),
       highFreqHz: Math.max(sel.lowFreqHz, sel.highFreqHz),
       comment,
@@ -1728,11 +1819,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     const file = state.files[win.fileId];
     if (!file) return null;
     const sel = win.selection;
+    const winOff = file.windowStartSec ?? 0;
     return state.addAnnotation({
       soundfile: file.name,
       channel: sel.channel,
-      startTimeSec: Math.min(sel.startSec, sel.endSec),
-      endTimeSec: Math.max(sel.startSec, sel.endSec),
+      startTimeSec: winOff + Math.min(sel.startSec, sel.endSec),
+      endTimeSec: winOff + Math.max(sel.startSec, sel.endSec),
       lowFreqHz: Math.min(sel.lowFreqHz, sel.highFreqHz),
       highFreqHz: Math.max(sel.lowFreqHz, sel.highFreqHz),
       comment,
@@ -1794,20 +1886,40 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     const file = state.files[matchingWin.fileId];
     if (!file) return;
 
-    const currentSpan = matchingWin.viewRange.endSec - matchingWin.viewRange.startSec;
-    const span =
-      matchingWin.displaySettings.timeScaleMode === 'fixed'
-        ? currentSpan
-        : Math.max(0.25, (ann.endTimeSec - ann.startTimeSec) * 3.0);
-    const center = 0.5 * (ann.startTimeSec + ann.endTimeSec);
-    const startSec = Math.max(0, Math.min(file.durationSec - span, center - span / 2));
-    const endSec = Math.min(file.durationSec, startSec + span);
-    state.focusWindow(matchingWin.windowId);
-    state.updateWindowViewRange(matchingWin.windowId, {
-      ...matchingWin.viewRange,
-      startSec,
-      endSec,
-    });
+    const applyJump = (curFile: AudioFileInfo, curWin: MDIWindowState) => {
+      const winOff = curFile.windowStartSec ?? 0;
+      const relStart = ann.startTimeSec - winOff;
+      const relEnd = ann.endTimeSec - winOff;
+      const currentSpan = curWin.viewRange.endSec - curWin.viewRange.startSec;
+      const span =
+        curWin.displaySettings.timeScaleMode === 'fixed'
+          ? currentSpan
+          : Math.max(0.25, (relEnd - relStart) * 3.0);
+      const center = 0.5 * (relStart + relEnd);
+      const startSec = Math.max(0, Math.min(Math.max(0, curFile.durationSec - span), center - span / 2));
+      const endSec = Math.min(curFile.durationSec, startSec + span);
+      get().focusWindow(curWin.windowId);
+      get().updateWindowViewRange(curWin.windowId, {
+        ...curWin.viewRange,
+        startSec,
+        endSec,
+      });
+    };
+
+    const winOff = file.windowStartSec ?? 0;
+    const winEnd = winOff + file.durationSec;
+    if (file.isPartialWindow && (ann.endTimeSec < winOff || ann.startTimeSec > winEnd)) {
+      const targetStart = Math.max(0, ann.startTimeSec - file.durationSec * 0.25);
+      void state.setArchiveWindow(matchingWin.windowId, targetStart, file.durationSec).then(() => {
+        const s2 = get();
+        const w2 = s2.windows.find((w) => w.windowId === matchingWin.windowId);
+        const f2 = w2 ? s2.files[w2.fileId] : undefined;
+        if (w2 && f2) applyJump(f2, w2);
+      });
+      return;
+    }
+
+    applyJump(file, matchingWin);
   },
 
   navigateAnnotation: (dir) => {

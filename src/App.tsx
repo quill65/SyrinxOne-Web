@@ -30,12 +30,15 @@ import type { DesktopBridge } from '@syrinxone/shared';
 import { getCachedSpectrogram, useWorkspaceStore } from './store/workspaceStore';
 import { audioPlayer, type PlaybackState } from './audio/WebAudioPlayer';
 import { copySpectrogramImageToClipboard } from './utils/exportImage';
+import { isCombinedFileId } from './utils/combinedEngine';
+import { getSafeMaxWindowSec } from './utils/spectrogramFetch';
 import { MDIWorkspace } from './components/mdi/MDIWorkspace';
 import { SpecSettingsPanel } from './components/dialogs/SpecSettingsPanel';
 import { AnnotationDrawer } from './components/annotations/AnnotationDrawer';
 import { HotkeyConfigModal } from './components/annotations/HotkeyConfigModal';
 import { KlipnSaveModal } from './components/dialogs/KlipnSaveModal';
 import { SourceModal } from './components/dialogs/SourceModal';
+import { ArchiveAboutModal } from './components/dialogs/ArchiveAboutModal';
 import { FileBrowserModal } from './components/dialogs/FileBrowserModal';
 import { DetectSoundsModal } from './components/dialogs/DetectSoundsModal';
 import { EngineConnectionModal } from './components/dialogs/EngineConnectionModal';
@@ -964,9 +967,14 @@ export const App: React.FC = () => {
               </div>
 
               <div className="mobile-swipe-pane mobile-center-pane">
-                {activeWin && activeFile?.isPartialWindow && (
-                  <ArchiveTimelineBar win={activeWin} file={activeFile} />
-                )}
+                {activeWin &&
+                  activeFile &&
+                  (activeFile.isPartialWindow ||
+                    isCombinedFileId(activeFile.fileId) ||
+                    (activeFile.totalDurationSec ?? activeFile.durationSec) >
+                      getSafeMaxWindowSec(activeFile.sampleRate, activeFile.numChannels)) && (
+                    <ArchiveTimelineBar win={activeWin} file={activeFile} />
+                  )}
                 <div className="workspace-center">
                   <MDIWorkspace />
                   {showAnnotationDrawer && <AnnotationDrawer />}
@@ -981,9 +989,14 @@ export const App: React.FC = () => {
         </>
       ) : (
         <>
-          {activeWin && activeFile?.isPartialWindow && (
-            <ArchiveTimelineBar win={activeWin} file={activeFile} />
-          )}
+          {activeWin &&
+            activeFile &&
+            (activeFile.isPartialWindow ||
+              isCombinedFileId(activeFile.fileId) ||
+              (activeFile.totalDurationSec ?? activeFile.durationSec) >
+                getSafeMaxWindowSec(activeFile.sampleRate, activeFile.numChannels)) && (
+              <ArchiveTimelineBar win={activeWin} file={activeFile} />
+            )}
 
           <div className="workspace-main">
             <div className="workspace-center">
@@ -997,6 +1010,7 @@ export const App: React.FC = () => {
       )}
 
       <SourceModal />
+      <ArchiveAboutModal />
       <FileBrowserModal />
       <EngineConnectionModal />
       <HotkeyConfigModal />

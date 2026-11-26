@@ -48,11 +48,12 @@ export const AnnotationDrawer: React.FC = () => {
   const handleLogCurrentSelection = () => {
     if (!activeWin || !activeWin.selection || !activeFile) return;
     const sel = activeWin.selection;
+    const winOff = activeFile.windowStartSec ?? 0;
     addAnnotation({
       soundfile: activeFile.name,
       channel: sel.channel,
-      startTimeSec: Math.min(sel.startSec, sel.endSec),
-      endTimeSec: Math.max(sel.startSec, sel.endSec),
+      startTimeSec: winOff + Math.min(sel.startSec, sel.endSec),
+      endTimeSec: winOff + Math.max(sel.startSec, sel.endSec),
       lowFreqHz: Math.min(sel.lowFreqHz, sel.highFreqHz),
       highFreqHz: Math.max(sel.lowFreqHz, sel.highFreqHz),
       comment: '',

@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowLeft,
+  BookOpen,
   Calendar,
   FileAudio,
   FileText,
@@ -54,6 +55,12 @@ import {
   type RecordingTimeContext,
 } from '../../utils/timeFormat';
 import { GoogleSignInButton } from '../auth/GoogleSignInButton';
+import {
+  buildStaticArchiveAbout,
+  discoverArchiveDocumentation,
+  isDocumentationEntryName,
+  type ArchiveTargetInput,
+} from '../../utils/archiveDocs';
 
 interface PendingCombinePrompt {
   origin: 'source' | 'drive';
@@ -76,6 +83,7 @@ export const FileBrowserModal: React.FC = () => {
   const activeSourceDisplayName = useWorkspaceStore((s) => s.activeSourceDisplayName);
   const setActiveSource = useWorkspaceStore((s) => s.setActiveSource);
   const openSourceSelector = useWorkspaceStore((s) => s.openSourceSelector);
+  const openAboutArchive = useWorkspaceStore((s) => s.openAboutArchive);
   const engine = useWorkspaceStore((s) => s.engine);
   const openAudioFromSource = useWorkspaceStore((s) => s.openAudioFromSource);
   const openCombinedArchive = useWorkspaceStore((s) => s.openCombinedArchive);
@@ -129,7 +137,7 @@ export const FileBrowserModal: React.FC = () => {
     setBrowseError(null);
     setSelectedUris([]);
     try {
-      const list = await engine.browseSource(srcId, pfx, 300);
+      const list = await engine.browseSource(srcId, pfx, 1000);
       setEntries(list);
     } catch (err) {
       setEntries([]);
@@ -207,6 +215,55 @@ export const FileBrowserModal: React.FC = () => {
     () => sources.find((s) => s.sourceId === activeSourceId),
     [sources, activeSourceId],
   );
+
+  const currentAboutTarget = useMemo<ArchiveTargetInput>(
+    () => ({
+      sourceId: activeSourceId,
+      displayName: activeSourceInfo?.displayName || activeSourceDisplayName || activeSourceId,
+      kind: activeSourceInfo?.kind ?? (isDriveSource ? 'gdrive' : isHttpSource ? 'http' : undefined),
+      rootPath: activeSourceInfo?.rootPath,
+      description: activeSourceInfo?.description,
+      anonymous: activeSourceInfo?.anonymous,
+      currentPrefix: isDriveSource
+        ? currentDriveFolder.id === 'root' || currentDriveFolder.id === 'sharedWithMe'
+          ? ''
+          : currentDriveFolder.name
+        : prefix,
+      currentEntries: isDriveSource ? undefined : entries,
+      currentDriveItems: isDriveSource ? driveItems : undefined,
+    }),
+    [
+      activeSourceId,
+      activeSourceInfo,
+      activeSourceDisplayName,
+      isDriveSource,
+      isHttpSource,
+      currentDriveFolder,
+      prefix,
+      entries,
+      driveItems,
+    ],
+  );
+
+  const [browserAboutBrief, setBrowserAboutBrief] = useState<string>('');
+  const [browserDocCount, setBrowserDocCount] = useState<number>(0);
+
+  useEffect(() => {
+    if (!show) return;
+    let cancelled = false;
+    const staticSpec = buildStaticArchiveAbout(currentAboutTarget);
+    setBrowserAboutBrief(staticSpec.briefDescription);
+    setBrowserDocCount(staticSpec.readmeFiles.length + staticSpec.documentationLinks.length);
+
+    void discoverArchiveDocumentation(engine, currentAboutTarget, { readText: true }).then((spec) => {
+      if (cancelled) return;
+      setBrowserAboutBrief(spec.briefDescription);
+      setBrowserDocCount(spec.readmeFiles.length + spec.documentationLinks.length);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [show, engine, currentAboutTarget]);
 
   const visibleEntries = useMemo(() => {
     const q = filterText.trim().toLowerCase();
@@ -309,7 +366,14 @@ export const FileBrowserModal: React.FC = () => {
     fileName?: string,
     sizeBytes?: number,
     existingKey?: string,
-  ): { startSec?: number; maxDurationSec?: number; restoreSaved?: boolean } | undefined => {
+  ): {
+    startSec?: number;
+    maxDurationSec?: number;
+    fullTimeline?: boolean;
+    sizeBytes?: number;
+    name?: string;
+    restoreSaved?: boolean;
+  } | undefined => {
     const itemCtx: RecordingTimeContext | null = fileName
       ? {
           name: fileName,
@@ -328,14 +392,28 @@ export const FileBrowserModal: React.FC = () => {
       existingKey &&
       getRecordingViewState(existingKey)
     ) {
-      return { restoreSaved: true };
+      return {
+        restoreSaved: true,
+        fullTimeline: true,
+        sizeBytes,
+        name: fileName,
+      };
     }
     if (windowPreset === 'auto') {
-      const smartLen = fileName ? getSmartArchiveWindowSec(fileName, sizeBytes) : 900;
-      if (smartLen === undefined && parsedStart === 0) return undefined;
+      if (manualStartOverride) {
+        const smartLen = fileName ? getSmartArchiveWindowSec(fileName, sizeBytes) : 900;
+        return {
+          startSec: parsedStart,
+          ...(smartLen !== undefined ? { maxDurationSec: smartLen } : {}),
+          fullTimeline: false,
+          sizeBytes,
+          name: fileName,
+        };
+      }
       return {
-        startSec: parsedStart,
-        ...(smartLen !== undefined ? { maxDurationSec: smartLen } : {}),
+        fullTimeline: true,
+        sizeBytes,
+        name: fileName,
       };
     }
     const len =
@@ -345,6 +423,9 @@ export const FileBrowserModal: React.FC = () => {
     return {
       startSec: parsedStart,
       maxDurationSec: len,
+      fullTimeline: false,
+      sizeBytes,
+      name: fileName,
     };
   };
 
@@ -544,6 +625,8 @@ export const FileBrowserModal: React.FC = () => {
       );
       setPrefsVersion((v) => v + 1);
       setModalState('showFileBrowser', false);
+    } else if (isDocumentationEntryName(entry.name)) {
+      openAboutArchive({ ...currentAboutTarget, focusDocUri: entry.uri });
     } else if (entry.kind === 'annotation') {
       await importAnnotationsFromSource(activeSourceId, entry.uri);
       setModalState('showFileBrowser', false);
@@ -579,6 +662,11 @@ export const FileBrowserModal: React.FC = () => {
     if (item.isFolder) {
       setFilterText('');
       setDriveBreadcrumbs((prev) => [...prev, { id: item.id, name: item.name }]);
+      return;
+    }
+
+    if (item.isDoc || isDocumentationEntryName(item.name)) {
+      openAboutArchive({ ...currentAboutTarget, focusDocUri: item.id });
       return;
     }
 
@@ -754,6 +842,13 @@ export const FileBrowserModal: React.FC = () => {
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
             <button
               className="btn-small"
+              onClick={() => openAboutArchive(currentAboutTarget)}
+              title="View archive details, READMEs & documentation links"
+            >
+              <BookOpen size={12} /> About Archive{browserDocCount > 0 ? ` (${browserDocCount})` : ''}
+            </button>
+            <button
+              className="btn-small"
               onClick={() => openSourceSelector(true)}
               title="Switch active acoustic data source"
             >
@@ -810,6 +905,19 @@ export const FileBrowserModal: React.FC = () => {
               )}
             </div>
           </div>
+
+          {browserAboutBrief && (
+            <div className="browser-about-strip">
+              <span className="browser-about-brief">{browserAboutBrief}</span>
+              <button
+                type="button"
+                className="browser-about-link"
+                onClick={() => openAboutArchive(currentAboutTarget)}
+              >
+                <BookOpen size={11} /> Docs &amp; README
+              </button>
+            </div>
+          )}
 
           {recentViews.length > 0 && (
             <div className="recent-views-strip">
@@ -871,7 +979,7 @@ export const FileBrowserModal: React.FC = () => {
                 onChange={(e) => setWindowPreset(e.target.value)}
                 style={{ width: 'auto', minWidth: 110 }}
               >
-                <option value="auto">Auto (Smart / Saved)</option>
+                <option value="auto">Auto (Full / Saved)</option>
                 <option value="60">1 min</option>
                 <option value="300">5 min</option>
                 <option value="900">15 min</option>

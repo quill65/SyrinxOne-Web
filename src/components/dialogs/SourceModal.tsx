@@ -1,10 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import {
+  BookOpen,
   Check,
   ChevronDown,
   ChevronRight,
   Cloud,
   Database,
+  FileText,
   FolderOpen,
   Globe,
   HardDrive,
@@ -24,6 +26,13 @@ import {
   toGoogleUserProfile,
 } from '../../auth/googleAuth';
 import { GoogleSignInButton } from '../auth/GoogleSignInButton';
+import {
+  DataSourceToArchiveTarget,
+  buildStaticArchiveAbout,
+  discoverArchiveDocumentation,
+  type ArchiveAboutSpec,
+  type ArchiveTargetInput,
+} from '../../utils/archiveDocs';
 
 interface ArchivePreset {
   label: string;
@@ -79,6 +88,7 @@ export const SourceModal: React.FC = () => {
   const engine = useWorkspaceStore((s) => s.engine);
   const activeSourceId = useWorkspaceStore((s) => s.activeSourceId);
   const setActiveSource = useWorkspaceStore((s) => s.setActiveSource);
+  const openAboutArchive = useWorkspaceStore((s) => s.openAboutArchive);
   const setModalState = useWorkspaceStore((s) => s.setModalState);
   const setStatus = useWorkspaceStore((s) => s.setStatus);
   const googleUser = useWorkspaceStore((s) => s.googleUser);
@@ -86,6 +96,7 @@ export const SourceModal: React.FC = () => {
   const setGoogleAuthState = useWorkspaceStore((s) => s.setGoogleAuthState);
 
   const [sources, setSources] = useState<DataSourceInfo[]>([]);
+  const [archiveDocsMap, setArchiveDocsMap] = useState<Record<string, ArchiveAboutSpec>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [driveBusyAuth, setDriveBusyAuth] = useState(false);
@@ -108,6 +119,42 @@ export const SourceModal: React.FC = () => {
     try {
       const list = await engine.listSources();
       setSources(list);
+      const initialMap: Record<string, ArchiveAboutSpec> = {};
+      for (const s of list) {
+        initialMap[s.sourceId] = buildStaticArchiveAbout(DataSourceToArchiveTarget(s));
+      }
+      for (const p of ARCHIVE_PRESETS) {
+        const pid = p.req.sourceId ?? p.label;
+        initialMap[pid] = buildStaticArchiveAbout({
+          sourceId: pid,
+          displayName: p.label,
+          kind: p.req.kind,
+          rootPath: p.req.prefix,
+          connectReq: p.req,
+          anonymous: p.req.anonymous,
+        });
+      }
+      setArchiveDocsMap((prev) => ({ ...initialMap, ...prev }));
+
+      // Discover README / doc files across connected sources in parallel
+      void Promise.all(
+        list.map(async (s) => {
+          const spec = await discoverArchiveDocumentation(
+            engine,
+            DataSourceToArchiveTarget(s),
+            { readText: true },
+          );
+          return [s.sourceId, spec] as const;
+        }),
+      ).then((entries) => {
+        setArchiveDocsMap((prev) => {
+          const next = { ...prev };
+          for (const [id, spec] of entries) {
+            next[id] = spec;
+          }
+          return next;
+        });
+      });
     } catch (err) {
       setSources([]);
       setError(err instanceof Error ? err.message : 'Failed to list connected sources');
@@ -130,6 +177,11 @@ export const SourceModal: React.FC = () => {
     if (openBrowserAfter) {
       setModalState('showFileBrowser', true);
     }
+  };
+
+  const handleOpenAbout = (e: React.MouseEvent, target: ArchiveTargetInput) => {
+    e.stopPropagation();
+    openAboutArchive(target);
   };
 
   const handleConnectPreset = async (preset: ArchivePreset) => {
@@ -219,6 +271,12 @@ export const SourceModal: React.FC = () => {
   };
 
   const hasHttpSource = sources.some((s) => s.sourceId === 'http');
+  const gdriveAboutTarget: ArchiveTargetInput = {
+    sourceId: 'gdrive_oauth',
+    displayName: 'My Google Drive',
+    kind: 'gdrive',
+  };
+  const gdriveAbout = archiveDocsMap.gdrive_oauth ?? buildStaticArchiveAbout(gdriveAboutTarget);
 
   return (
     <div className="modal-backdrop" onClick={() => setModalState('showSourceModal', false)}>
@@ -257,6 +315,9 @@ export const SourceModal: React.FC = () => {
 
               {sources.map((src) => {
                 const isActive = activeSourceId === src.sourceId;
+                const target = DataSourceToArchiveTarget(src);
+                const docInfo = archiveDocsMap[src.sourceId] ?? buildStaticArchiveAbout(target);
+                const readmeBadge = docInfo.readmeFiles[0]?.name;
                 return (
                   <div
                     key={src.sourceId}
@@ -278,22 +339,41 @@ export const SourceModal: React.FC = () => {
                         {src.kind === 'local_fs' ? 'Device upload & engine folder' : src.kind.toUpperCase()}
                         {src.anonymous ? ' · Public' : ''}
                         {src.rootPath ? ` · ${src.rootPath}` : ''}
+                        {readmeBadge && (
+                          <span className="source-doc-badge" title="Documentation file found in archive">
+                            <FileText size={10} /> {readmeBadge}
+                          </span>
+                        )}
                       </div>
+                      <div className="source-card-desc">{docInfo.briefDescription}</div>
                     </div>
-                    {isActive && (
-                      <span className="source-active-mark">
-                        <Check size={13} /> Active
-                      </span>
-                    )}
-                    {src.removable && (
+                    <div
+                      className="source-card-actions"
+                      onClick={(e) => e.stopPropagation()}
+                    >
                       <button
-                        className="mdi-icon-btn"
-                        title="Remove source"
-                        onClick={(e) => void handleRemoveSource(e, src)}
+                        type="button"
+                        className="btn-small source-about-btn"
+                        title={`Read detailed info & documentation links for ${src.displayName}`}
+                        onClick={(e) => handleOpenAbout(e, target)}
                       >
-                        <Trash2 size={13} />
+                        <BookOpen size={12} /> About
                       </button>
-                    )}
+                      {isActive && (
+                        <span className="source-active-mark">
+                          <Check size={13} /> Active
+                        </span>
+                      )}
+                      {src.removable && (
+                        <button
+                          className="mdi-icon-btn"
+                          title="Remove source"
+                          onClick={(e) => void handleRemoveSource(e, src)}
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 );
               })}
@@ -313,11 +393,20 @@ export const SourceModal: React.FC = () => {
                       ? `Signed in · ${googleUser?.email ?? googleUser?.displayName ?? 'Ready'}`
                       : 'Private & shared folders via Google account'}
                   </div>
+                  <div className="source-card-desc">{gdriveAbout.briefDescription}</div>
                 </div>
                 <div
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                  className="source-card-actions"
                   onClick={(e) => e.stopPropagation()}
                 >
+                  <button
+                    type="button"
+                    className="btn-small source-about-btn"
+                    title="About Google Drive archive access"
+                    onClick={(e) => handleOpenAbout(e, gdriveAboutTarget)}
+                  >
+                    <BookOpen size={12} /> About
+                  </button>
                   {hasDriveToken ? (
                     <>
                       {activeSourceId === 'gdrive_oauth' && (
@@ -356,12 +445,34 @@ export const SourceModal: React.FC = () => {
                   <div className="source-card-meta">
                     <div className="source-card-title">Direct Audio URL</div>
                     <div className="source-card-sub">Stream .wav / .flac / .ogg / .mp3 links</div>
+                    <div className="source-card-desc">
+                      {buildStaticArchiveAbout({
+                        sourceId: 'http',
+                        displayName: 'Direct Audio URL',
+                        kind: 'http',
+                      }).briefDescription}
+                    </div>
                   </div>
-                  {activeSourceId === 'http' && (
-                    <span className="source-active-mark">
-                      <Check size={13} /> Active
-                    </span>
-                  )}
+                  <div className="source-card-actions" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      type="button"
+                      className="btn-small source-about-btn"
+                      onClick={(e) =>
+                        handleOpenAbout(e, {
+                          sourceId: 'http',
+                          displayName: 'Direct Audio URL',
+                          kind: 'http',
+                        })
+                      }
+                    >
+                      <BookOpen size={12} /> About
+                    </button>
+                    {activeSourceId === 'http' && (
+                      <span className="source-active-mark">
+                        <Check size={13} /> Active
+                      </span>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -371,21 +482,42 @@ export const SourceModal: React.FC = () => {
             <div className="connect-section-title">Public Ocean &amp; Bioacoustic Archives</div>
             <div className="preset-cards">
               {ARCHIVE_PRESETS.map((p) => {
-                const alreadyConnected = sources.some((s) => s.sourceId === p.req.sourceId);
-                const isActive = activeSourceId === p.req.sourceId;
+                const pid = p.req.sourceId ?? p.label;
+                const alreadyConnected = sources.some((s) => s.sourceId === pid);
+                const isActive = activeSourceId === pid;
+                const presetTarget: ArchiveTargetInput = {
+                  sourceId: pid,
+                  displayName: p.label,
+                  kind: p.req.kind,
+                  rootPath: p.req.prefix,
+                  connectReq: p.req,
+                  anonymous: p.req.anonymous,
+                };
+                const presetDoc = archiveDocsMap[pid] ?? buildStaticArchiveAbout(presetTarget);
                 return (
                   <div key={p.label} className="preset-card">
-                    <div style={{ minWidth: 0 }}>
+                    <div style={{ minWidth: 0, flex: 1 }}>
                       <div className="preset-title">{p.label}</div>
                       <div className="preset-sub">{p.subtitle}</div>
+                      <div className="source-card-desc">{presetDoc.briefDescription}</div>
                     </div>
-                    <button
-                      className={`btn-small ${isActive ? 'btn-active' : 'btn-primary'}`}
-                      disabled={connectBusy}
-                      onClick={() => void handleConnectPreset(p)}
-                    >
-                      {isActive ? 'Active' : alreadyConnected ? 'Use' : 'Connect'}
-                    </button>
+                    <div className="source-card-actions">
+                      <button
+                        type="button"
+                        className="btn-small source-about-btn"
+                        title={`About ${p.label}`}
+                        onClick={(e) => handleOpenAbout(e, presetTarget)}
+                      >
+                        <BookOpen size={12} /> About
+                      </button>
+                      <button
+                        className={`btn-small ${isActive ? 'btn-active' : 'btn-primary'}`}
+                        disabled={connectBusy}
+                        onClick={() => void handleConnectPreset(p)}
+                      >
+                        {isActive ? 'Active' : alreadyConnected ? 'Use' : 'Connect'}
+                      </button>
+                    </div>
                   </div>
                 );
               })}

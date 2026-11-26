@@ -2292,6 +2292,355 @@ body,
   margin-top: 4px;
 }
 
+/* Archive Descriptions & About Archive Modal */
+.source-card-desc {
+  font-size: 11px;
+  color: #cbd5e1;
+  line-height: 1.38;
+  margin-top: 3px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.source-card-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.source-doc-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(56, 189, 248, 0.14);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  color: #7dd3fc;
+  font-size: 10px;
+}
+
+.source-about-btn {
+  color: #7dd3fc;
+}
+
+.browser-about-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 9px;
+  border-radius: 5px;
+  background: rgba(15, 23, 34, 0.85);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  color: #cbd5e1;
+}
+
+.browser-about-brief {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-about-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  color: #38bdf8;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 1px 4px;
+}
+
+.browser-about-link:hover {
+  color: #7dd3fc;
+  text-decoration: underline;
+}
+
+.about-archive-backdrop {
+  z-index: 10025;
+}
+
+.about-archive-card {
+  max-height: 88vh;
+}
+
+.about-archive-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.about-hero-box {
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #0d1623;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.about-hero-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.about-hero-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  background: rgba(56, 189, 248, 0.12);
+  flex-shrink: 0;
+}
+
+.about-hero-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #f8fafc;
+}
+
+.about-hero-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  word-break: break-word;
+}
+
+.about-hero-brief {
+  font-size: 12px;
+  color: #e2e8f0;
+  line-height: 1.45;
+}
+
+.about-highlights-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+  gap: 6px;
+}
+
+.about-highlight-cell {
+  padding: 7px 9px;
+  border-radius: 5px;
+  background: var(--bg-root);
+  border: 1px solid var(--border);
+}
+
+.about-highlight-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.about-highlight-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  margin-top: 2px;
+}
+
+.about-section {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.about-loading-pill {
+  margin-left: 8px;
+  font-size: 10px;
+  font-weight: 500;
+  color: #7dd3fc;
+}
+
+.about-prose {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #cbd5e1;
+}
+
+.about-prose p {
+  margin: 0;
+}
+
+.about-empty-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 8px 10px;
+  border-radius: 5px;
+  background: var(--bg-root);
+  border: 1px dashed var(--border);
+}
+
+.about-readme-files {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.about-doc-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  background: var(--bg-root);
+  border: 1px solid var(--border);
+}
+
+.about-doc-row.active {
+  border-color: var(--border-active);
+  background: rgba(14, 165, 233, 0.12);
+}
+
+.about-doc-select {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  padding: 2px 0;
+}
+
+.about-doc-name {
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.about-doc-loc {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.about-doc-size {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.about-ext-btn {
+  text-decoration: none;
+  flex-shrink: 0;
+}
+
+.about-pdf-callout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 11px;
+  border-radius: 5px;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  font-size: 12px;
+  color: #fde68a;
+}
+
+.about-pdf-callout a {
+  text-decoration: none;
+}
+
+.about-readme-viewer {
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: #0a1018;
+  overflow: hidden;
+}
+
+.about-readme-viewer-head {
+  padding: 5px 9px;
+  font-size: 11px;
+  color: #94a3b8;
+  background: #0f1722;
+  border-bottom: 1px solid var(--border);
+}
+
+.about-readme-pre {
+  margin: 0;
+  padding: 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #e2e8f0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.about-links-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.about-link-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 5px;
+  background: var(--bg-root);
+  border: 1px solid var(--border);
+  text-decoration: none;
+  color: var(--text);
+}
+
+.about-link-card:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-active);
+}
+
+.about-link-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #7dd3fc;
+}
+
+.about-link-desc {
+  font-size: 11px;
+  color: #cbd5e1;
+  margin-top: 2px;
+}
+
+.about-link-url {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+
 
 
 

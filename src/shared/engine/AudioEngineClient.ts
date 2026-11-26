@@ -275,7 +275,7 @@ export class HttpAudioEngineClient implements AudioEngineClient {
     });
   }
 
-  async browseSource(sourceId: string, prefix = '', limit = 250): Promise<BrowseEntry[]> {
+  async browseSource(sourceId: string, prefix = '', limit = 1000): Promise<BrowseEntry[]> {
     const q = new URLSearchParams({ prefix, limit: String(limit) });
     const url = `/api/sources/${encodeURIComponent(sourceId)}/browse?${q.toString()}`;
     try {
@@ -389,10 +389,10 @@ export class HttpAudioEngineClient implements AudioEngineClient {
       fft_size: String(params.fftSize),
       hop_size: String(params.hopSize),
       window_type: params.windowType,
-      dsp_mode: params.dspMode,
+      dsp_mode: 'modern_stft',
       pop_filter: String(params.popFilter),
-      classic_gain: String(params.classicGain),
-      classic_white_thresh: String(params.classicWhiteThresh),
+      classic_gain: '1',
+      classic_white_thresh: '0',
     });
     if (range?.startSec !== undefined) q.set('start_sec', String(range.startSec));
     if (range?.endSec !== undefined) q.set('end_sec', String(range.endSec));
@@ -437,7 +437,7 @@ export class HttpAudioEngineClient implements AudioEngineClient {
         maxFreqHz,
         minValue,
         maxValue,
-        dspMode: params.dspMode,
+        dspMode: 'modern_stft',
         data: new Float32Array(buf),
       };
     });
@@ -455,10 +455,10 @@ export class HttpAudioEngineClient implements AudioEngineClient {
       fft_size: String(params.fftSize),
       hop_size: String(params.hopSize),
       window_type: params.windowType,
-      dsp_mode: params.dspMode,
+      dsp_mode: 'modern_stft',
       pop_filter: String(params.popFilter),
-      classic_gain: String(params.classicGain),
-      classic_white_thresh: String(params.classicWhiteThresh),
+      classic_gain: '1',
+      classic_white_thresh: '0',
       colormap: display.colormap,
       gain_db: String(display.gainDb),
       threshold_db: String(display.thresholdDb),
@@ -501,7 +501,7 @@ export class HttpAudioEngineClient implements AudioEngineClient {
       fft_size: String(params.fftSize),
       hop_size: String(params.hopSize),
       window_type: params.windowType,
-      dsp_mode: params.dspMode,
+      dsp_mode: 'modern_stft',
       pop_filter: String(params.popFilter),
     });
     if (range?.startSec !== undefined) q.set('start_sec', String(range.startSec));

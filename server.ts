@@ -267,7 +267,7 @@ const SOUND_SOURCE_TOOLS: FunctionDeclaration[] = [
         },
         limit: {
           type: Type.INTEGER,
-          description: 'Maximum entries to return (default 100, max 300).',
+          description: 'Maximum entries to return (default 500, max 1000).',
         },
       },
       required: ['sourceId'],
@@ -276,7 +276,7 @@ const SOUND_SOURCE_TOOLS: FunctionDeclaration[] = [
   {
     name: 'inspect_recording_region',
     description:
-      'Run exact Python DSP spectral & amplitude measurements on any time/frequency region or channel of an already-opened recording (active file, other open window, or previously opened fileId), and optionally fetch its spectrogram PNG and spectral slice.',
+      'Run Python DSP spectral & amplitude measurements on ANY time/frequency region (0..totalDurationSec) or channel of an opened single or combined recording—automatically using sparse spectral-line sampling on wide multi-hour/multi-day intervals and full-resolution STFT on focused regions—and optionally fetch its spectrogram PNG and spectral summary.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -290,11 +290,11 @@ const SOUND_SOURCE_TOOLS: FunctionDeclaration[] = [
         },
         startSec: {
           type: Type.NUMBER,
-          description: 'Start time in seconds within the loaded recording.',
+          description: 'Start time in seconds within the complete recording (0..totalDurationSec).',
         },
         endSec: {
           type: Type.NUMBER,
-          description: 'End time in seconds within the loaded recording.',
+          description: 'End time in seconds within the complete recording (0..totalDurationSec).',
         },
         lowFreqHz: {
           type: Type.NUMBER,
@@ -835,6 +835,79 @@ async function startServer() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Gemini API request failed';
       res.status(500).json({ error: msg });
+    }
+  });
+
+  app.get('/api/archive-docs/read', async (req, res) => {
+    const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+    if (!rawUrl) {
+      res.status(400).json({ error: 'Missing url query parameter' });
+      return;
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      res.status(400).json({ error: 'Invalid URL' });
+      return;
+    }
+
+    if (parsed.protocol !== 'https:') {
+      res.status(400).json({ error: 'Only https:// documentation URLs are supported' });
+      return;
+    }
+
+    const host = parsed.hostname.toLowerCase();
+    const isPrivateOrLiteral =
+      host === 'localhost' ||
+      host.endsWith('.local') ||
+      host.endsWith('.internal') ||
+      /^\d+\.\d+\.\d+\.\d+$/.test(host) ||
+      host.includes(':');
+    if (isPrivateOrLiteral) {
+      res.status(403).json({ error: 'Disallowed host' });
+      return;
+    }
+
+    try {
+      const upstream = await fetch(parsed.toString(), {
+        redirect: 'error',
+        signal: AbortSignal.timeout(6000),
+        headers: {
+          Accept: 'text/plain, text/markdown, text/*, application/json, application/xml;q=0.9',
+        },
+      });
+      if (!upstream.ok) {
+        res.status(upstream.status).json({ error: `Upstream returned ${upstream.status}` });
+        return;
+      }
+      const ct = (upstream.headers.get('content-type') || '').toLowerCase();
+      const looksTextPath = /\.(md|markdown|txt|rst|csv|tsv|json|xml|yaml|yml)$/i.test(
+        parsed.pathname,
+      );
+      if (
+        !ct.startsWith('text/') &&
+        !ct.includes('json') &&
+        !ct.includes('xml') &&
+        !looksTextPath
+      ) {
+        res.status(415).json({ error: `Non-text content-type (${ct || 'unknown'})`, contentType: ct });
+        return;
+      }
+
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      const maxBytes = 131072;
+      const truncated = buf.byteLength > maxBytes;
+      const text = buf.subarray(0, maxBytes).toString('utf8');
+      res.json({
+        url: parsed.toString(),
+        contentType: ct || 'text/plain',
+        truncated,
+        text,
+      });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'Failed to fetch document' });
     }
   });
 

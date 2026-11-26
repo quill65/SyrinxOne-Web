@@ -158,6 +158,8 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [touchMode, setTouchMode] = useState<'select' | 'pan'>('select');
   const [zoomMatrices, setZoomMatrices] = useState<Record<number, SpectrogramMatrix>>({});
+  const zoomMatricesRef = useRef<Record<number, SpectrogramMatrix>>({});
+  zoomMatricesRef.current = zoomMatrices;
 
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
   const lastTapRef = useRef<number>(0);
@@ -234,7 +236,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     win.specParams.popFilter,
   ]);
 
-  // Automatically fetch high-resolution STFT slice(s) when zooming into a downsampled recording
+  // Automatically fetch sharper/high-resolution STFT slice(s) when zooming into a downsampled or sparse recording
   useEffect(() => {
     if (win.displaySettings.renderMode === 'server_bitmap') {
       setZoomMatrices({});
@@ -254,22 +256,27 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
       const isDownsampledOverview = ovMat.timeStepSec > nativeStep * 1.5;
       if (!isDownsampledOverview || spanT >= file.durationSec * 0.45) continue;
 
-      const existing = zoomMatrices[ch];
-      if (
+      const existing = zoomMatricesRef.current[ch];
+      const existingCovers =
         existing &&
         existing.fileId === file.fileId &&
         existing.channel === ch &&
         existing.startSec <= win.viewRange.startSec + 0.01 &&
-        existing.endSec >= win.viewRange.endSec - 0.01 &&
-        existing.endSec - existing.startSec <= spanT * 2.5
-      ) {
+        existing.endSec >= win.viewRange.endSec - 0.01;
+      const existingSpan = existing ? existing.endSec - existing.startSec : Infinity;
+      const zoomedMuchCloser =
+        existing &&
+        existing.timeStepSec > nativeStep * 1.5 &&
+        spanT < existingSpan * 0.35;
+
+      if (existingCovers && !zoomedMuchCloser && existingSpan <= spanT * 2.5) {
         continue;
       }
       channelsNeedingZoom.push(ch);
     }
 
     if (channelsNeedingZoom.length === 0) {
-      if (spanT >= file.durationSec * 0.45 && Object.keys(zoomMatrices).length > 0) {
+      if (spanT >= file.durationSec * 0.45 && Object.keys(zoomMatricesRef.current).length > 0) {
         setZoomMatrices({});
       }
       return;
@@ -287,6 +294,13 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
             file,
             { ...win.specParams, channel: ch },
             { startSec: reqStart, endSec: reqEnd },
+            undefined,
+            {
+              onProgress: (partial) => {
+                if (cancelled) return;
+                setZoomMatrices((prev) => ({ ...prev, [ch]: partial }));
+              },
+            },
           );
           return { ch, hiRes };
         }),
@@ -320,7 +334,6 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     win.viewRange.endSec,
     win.displaySettings.renderMode,
     spanT,
-    zoomMatrices,
   ]);
 
   const activeMatricesByChannel = useMemo(() => {
@@ -663,10 +676,12 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
       if (win.displaySettings.showAnnotations && win.displaySettings.showCursors) {
         for (const ann of visibleAnnotations) {
           if (stackChannels && ann.channel && ann.channel !== row.channel + 1) continue;
-          if (ann.endTimeSec < row.startSec || ann.startTimeSec > row.endSec) continue;
+          const relStart = ann.startTimeSec - windowOffsetSec;
+          const relEnd = ann.endTimeSec - windowOffsetSec;
+          if (relEnd < row.startSec || relStart > row.endSec) continue;
 
-          const x0 = rowTimeToX(row, ann.startTimeSec);
-          const x1 = rowTimeToX(row, ann.endTimeSec);
+          const x0 = rowTimeToX(row, relStart);
+          const x1 = rowTimeToX(row, relEnd);
           const yTop = rowFreqToY(row, ann.highFreqHz);
           const yBot = rowFreqToY(row, ann.lowFreqHz);
           const isSel = ann.id === selectedAnnotationId;
@@ -861,27 +876,30 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
       }
     }
 
+    const winOff = file.windowStartSec ?? 0;
     const selAnn = visibleAnnotations.find((a) => a.id === selectedAnnotationId);
     if (
       selAnn &&
       win.displaySettings.showAnnotations &&
-      (!stackChannels || !selAnn.channel || selAnn.channel === row.channel + 1) &&
-      selAnn.endTimeSec >= row.startSec &&
-      selAnn.startTimeSec <= row.endSec
+      (!stackChannels || !selAnn.channel || selAnn.channel === row.channel + 1)
     ) {
-      const x0 = rowTimeToX(row, selAnn.startTimeSec);
-      const x1 = rowTimeToX(row, selAnn.endTimeSec);
-      const yTop = rowFreqToY(row, selAnn.highFreqHz);
-      const yBot = rowFreqToY(row, selAnn.lowFreqHz);
-      for (const h of getBoxHandles(x0, yTop, x1, yBot)) {
-        if (Math.abs(rawX - h.x) <= HANDLE_RADIUS && Math.abs(rawY - h.y) <= HANDLE_RADIUS) {
-          return {
-            target: 'ann',
-            rowIndex: row.rowIndex,
-            ann: selAnn,
-            handle: h.id,
-            cursor: h.cursor,
-          };
+      const relStart = selAnn.startTimeSec - winOff;
+      const relEnd = selAnn.endTimeSec - winOff;
+      if (relEnd >= row.startSec && relStart <= row.endSec) {
+        const x0 = rowTimeToX(row, relStart);
+        const x1 = rowTimeToX(row, relEnd);
+        const yTop = rowFreqToY(row, selAnn.highFreqHz);
+        const yBot = rowFreqToY(row, selAnn.lowFreqHz);
+        for (const h of getBoxHandles(x0, yTop, x1, yBot)) {
+          if (Math.abs(rawX - h.x) <= HANDLE_RADIUS && Math.abs(rawY - h.y) <= HANDLE_RADIUS) {
+            return {
+              target: 'ann',
+              rowIndex: row.rowIndex,
+              ann: selAnn,
+              handle: h.id,
+              cursor: h.cursor,
+            };
+          }
         }
       }
     }
@@ -910,11 +928,12 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     timeSec: number,
     freqHz: number,
   ): AnnotationRecord | undefined => {
+    const absTime = (file.windowStartSec ?? 0) + timeSec;
     return visibleAnnotations.find(
       (a) =>
         (!stackChannels || !a.channel || a.channel === channel + 1) &&
-        timeSec >= a.startTimeSec &&
-        timeSec <= a.endTimeSec &&
+        absTime >= a.startTimeSec &&
+        absTime <= a.endTimeSec &&
         freqHz >= a.lowFreqHz &&
         freqHz <= a.highFreqHz,
     );
@@ -957,14 +976,15 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
           return;
         }
         if (handleHit.target === 'ann') {
+          const winOff = file.windowStartSec ?? 0;
           dragModeRef.current = {
             kind: 'resize_ann',
             anchorRowIndex: handleHit.rowIndex,
             annId: handleHit.ann.id,
             handle: handleHit.handle,
             orig: {
-              startSec: handleHit.ann.startTimeSec,
-              endSec: handleHit.ann.endTimeSec,
+              startSec: handleHit.ann.startTimeSec - winOff,
+              endSec: handleHit.ann.endTimeSec - winOff,
               lowFreqHz: handleHit.ann.lowFreqHz,
               highFreqHz: handleHit.ann.highFreqHz,
             },
@@ -1024,9 +1044,10 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
       updateWindowSelection(win.windowId, { ...next, channel: drag.orig.channel });
     } else if (drag.kind === 'resize_ann') {
       const next = applyHandleDrag(drag.orig, drag.handle, pt.timeSec, pt.freqHz, file.durationSec, nyquist);
+      const winOff = file.windowStartSec ?? 0;
       updateAnnotation(drag.annId, {
-        startTimeSec: next.startSec,
-        endTimeSec: next.endSec,
+        startTimeSec: winOff + next.startSec,
+        endTimeSec: winOff + next.endSec,
         lowFreqHz: next.lowFreqHz,
         highFreqHz: next.highFreqHz,
       });
@@ -1081,9 +1102,10 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
       if (s1 - s0 < 0.002 && f1 - f0 < 10) {
         updateWindowSelection(win.windowId, null);
       } else if (redefineAnnotationId) {
+        const winOff = file.windowStartSec ?? 0;
         updateAnnotation(redefineAnnotationId, {
-          startTimeSec: s0,
-          endTimeSec: s1,
+          startTimeSec: winOff + s0,
+          endTimeSec: winOff + s1,
           lowFreqHz: f0,
           highFreqHz: f1,
         });
@@ -1140,8 +1162,9 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     if (!pt) return;
     const hit = findAnnotationAt(pt.row.channel, pt.timeSec, pt.freqHz);
     if (hit) {
+      const winOff = file.windowStartSec ?? 0;
       selectAnnotation(hit.id, false);
-      playRange(hit.startTimeSec, hit.endTimeSec);
+      playRange(Math.max(0, hit.startTimeSec - winOff), Math.max(0.05, hit.endTimeSec - winOff));
     } else if (splitTimeRows > 1) {
       playRange(pt.row.startSec, pt.row.endSec);
     } else {

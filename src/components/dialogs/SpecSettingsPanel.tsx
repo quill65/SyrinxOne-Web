@@ -1,6 +1,6 @@
 import React from 'react';
 import { SlidersHorizontal, X } from 'lucide-react';
-import type { ColormapName, DspMode, RenderMode, TimeScaleMode, WindowType } from '@syrinxone/shared';
+import type { ColormapName, RenderMode, TimeScaleMode, WindowType } from '@syrinxone/shared';
 import { useWorkspaceStore } from '../../store/workspaceStore';
 import { MeasurementInspector } from '../panels/MeasurementInspector';
 
@@ -245,36 +245,6 @@ export const SpecSettingsPanel: React.FC = () => {
           </div>
 
           <div className="field-group">
-            <label>DSP Engine</label>
-            <select
-              value={spec.dspMode}
-              onChange={(e) =>
-                void updateWindowSpecParams(activeWin.windowId, {
-                  dspMode: e.target.value as DspMode,
-                })
-              }
-            >
-              <option value="modern_stft">Modern STFT</option>
-              <option value="classic_syrinx">Classic Syrinx</option>
-            </select>
-          </div>
-
-          <div className="field-group">
-            <label>Time Scale</label>
-            <select
-              value={disp.timeScaleMode}
-              onChange={(e) =>
-                updateWindowDisplaySettings(activeWin.windowId, {
-                  timeScaleMode: e.target.value as TimeScaleMode,
-                })
-              }
-            >
-              <option value="stretch">Stretch</option>
-              <option value="fixed">Fixed (ms/px)</option>
-            </select>
-          </div>
-
-          <div className="field-group">
             <label>Renderer</label>
             <select
               value={disp.renderMode}
@@ -288,6 +258,21 @@ export const SpecSettingsPanel: React.FC = () => {
               <option value="server_bitmap">Bitmap PNG</option>
             </select>
           </div>
+        </div>
+
+        <div className="field-group">
+          <label>Time Scale</label>
+          <select
+            value={disp.timeScaleMode}
+            onChange={(e) =>
+              updateWindowDisplaySettings(activeWin.windowId, {
+                timeScaleMode: e.target.value as TimeScaleMode,
+              })
+            }
+          >
+            <option value="stretch">Stretch</option>
+            <option value="fixed">Fixed (ms/px)</option>
+          </select>
         </div>
 
         {disp.timeScaleMode === 'fixed' && (

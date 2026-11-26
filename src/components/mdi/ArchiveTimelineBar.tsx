@@ -91,6 +91,8 @@ export const ArchiveTimelineBar: React.FC<Props> = ({ win, file }) => {
     };
   }, [startMs, rangeFmt.isDated, timeCtx, maxStart, effectiveStart]);
 
+  const isFullTimeline = !file.isPartialWindow && curLen >= totalDur - 1;
+
   const lengthOptions = useMemo(() => {
     const valid = PRESET_DURATIONS.filter((p) => p.sec <= Math.min(totalDur, safeMax));
     if (valid.length === 0) {
@@ -99,12 +101,16 @@ export const ArchiveTimelineBar: React.FC<Props> = ({ win, file }) => {
         label: formatDurationCompact(Math.min(60, totalDur)),
       });
     }
-    if (!valid.some((p) => Math.abs(p.sec - curLen) <= 2)) {
+    if (!isFullTimeline && !valid.some((p) => Math.abs(p.sec - curLen) <= 2)) {
       valid.push({ sec: curLen, label: formatDurationCompact(curLen) });
       valid.sort((a, b) => a.sec - b.sec);
     }
+    const fullSec = Math.max(1, Math.round(totalDur));
+    if (isCombined && (totalDur > safeMax || totalSegCount > 1)) {
+      valid.push({ sec: fullSec, label: `Full (${formatDurationCompact(totalDur)} · Sparse)` });
+    }
     return valid;
-  }, [totalDur, safeMax, curLen]);
+  }, [totalDur, safeMax, curLen, isFullTimeline, isCombined, totalSegCount]);
 
   const commitScrub = () => {
     if (scrubStart === null) return;
@@ -119,7 +125,10 @@ export const ArchiveTimelineBar: React.FC<Props> = ({ win, file }) => {
     const sec = parseTimeOrDateInput(jumpInput, timeCtx);
     if (sec === null) return;
     setShowMobileJump(false);
-    void setArchiveWindow(win.windowId, sec, curLen);
+    const jumpLen = isFullTimeline
+      ? Math.max(5, Math.min(900, safeMax, Math.round(totalDur)))
+      : curLen;
+    void setArchiveWindow(win.windowId, sec, jumpLen);
   };
 
   const handleDatePickerChange = (rawVal: string) => {
@@ -128,7 +137,10 @@ export const ArchiveTimelineBar: React.FC<Props> = ({ win, file }) => {
     const offsetSec = dateMsToRecordingOffset(pickedMs, timeCtx);
     if (offsetSec === null) return;
     setJumpInput(formatRecordingTime(offsetSec, timeCtx));
-    void setArchiveWindow(win.windowId, offsetSec, curLen);
+    const jumpLen = isFullTimeline
+      ? Math.max(5, Math.min(900, safeMax, Math.round(totalDur)))
+      : curLen;
+    void setArchiveWindow(win.windowId, offsetSec, jumpLen);
   };
 
   const jumpInputWidth = rangeFmt.isDated ? 138 : rangeFmt.isLong ? 92 : 70;
@@ -186,9 +198,9 @@ export const ArchiveTimelineBar: React.FC<Props> = ({ win, file }) => {
 
           <select
             className="rate-select"
-            value={curLen}
+            value={isFullTimeline ? Math.max(1, Math.round(totalDur)) : curLen}
             onChange={(e) => void setArchiveWindow(win.windowId, curStart, Number(e.target.value))}
-            title="View window duration"
+            title="View window duration (Full uses sparse spectral-line sampling)"
           >
             {lengthOptions.map((opt) => (
               <option key={opt.sec} value={opt.sec}>

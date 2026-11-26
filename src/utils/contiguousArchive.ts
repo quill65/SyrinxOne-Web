@@ -365,8 +365,8 @@ export async function collectAudioSpecsFromSource(
   engine: AudioEngineClient,
   sourceId: string,
   selected: ArchiveEntryLike[],
-  maxFiles = 200,
-  maxDepth = 3,
+  maxFiles = Number.POSITIVE_INFINITY,
+  maxDepth = 16,
 ): Promise<SegmentSourceSpec[]> {
   const out: SegmentSourceSpec[] = [];
   const seenUris = new Set<string>();
@@ -388,7 +388,7 @@ export async function collectAudioSpecsFromSource(
           });
         }
       } else if (depth < maxDepth) {
-        const subEntries = await engine.browseSource(sourceId, item.uri, 300);
+        const subEntries = await engine.browseSource(sourceId, item.uri, 1000);
         await walk(
           subEntries.filter((e) => e.name !== '..'),
           depth + 1,
@@ -412,8 +412,8 @@ export async function collectAudioSpecsFromDrive(
   rootFolderSourceId: string | null,
   currentFolderId: string,
   currentFolderName: string,
-  maxFiles = 200,
-  maxDepth = 3,
+  maxFiles = Number.POSITIVE_INFINITY,
+  maxDepth = 16,
 ): Promise<{ specs: SegmentSourceSpec[]; connectedSourceId: string }> {
   const activeSourceId =
     rootFolderSourceId || (await connectFolderFn(currentFolderId, currentFolderName));

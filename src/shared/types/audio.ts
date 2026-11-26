@@ -1,5 +1,5 @@
 export type WindowType = 'blackman' | 'hamming' | 'hann' | 'rect';
-export type DspMode = 'modern_stft' | 'classic_syrinx';
+export type DspMode = 'modern_stft';
 export type RenderMode = 'webgl_float32' | 'server_bitmap';
 export type TimeScaleMode = 'stretch' | 'fixed';
 export type ColormapName =
