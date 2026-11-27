@@ -10,7 +10,19 @@ export type ColormapName =
   | 'inferno'
   | 'turbo';
 
-export type DataSourceKind = 'local_fs' | 's3' | 'gcs' | 'gdrive' | 'http' | 'custom';
+export type DataSourceKind =
+  | 'local_fs'
+  | 's3'
+  | 'gcs'
+  | 'gdrive'
+  | 'http'
+  | 'zenodo'
+  | 'huggingface'
+  | 'inaturalist'
+  | 'xenocanto'
+  | 'freesound'
+  | 'custom'
+  | (string & {});
 
 export interface DataSourceInfo {
   sourceId: string;
@@ -24,7 +36,7 @@ export interface DataSourceInfo {
 }
 
 export interface CreateSourceRequest {
-  kind: 's3' | 'gcs' | 'gdrive' | 'http';
+  kind: string;
   sourceId?: string;
   displayName?: string;
   bucket?: string;
@@ -33,9 +45,78 @@ export interface CreateSourceRequest {
   endpointUrl?: string;
   anonymous?: boolean;
   folderOrUrl?: string;
+  query?: string;
   apiKey?: string;
   oauthToken?: string;
   readOnly?: boolean;
+  params?: Record<string, string | number | boolean>;
+}
+
+export type SourceAuthKind = 'none' | 'api_key' | 'oauth' | 'credentials';
+
+export interface DiscoveryProviderInfo {
+  providerId: string;
+  displayName: string;
+  description: string;
+  authRequired: boolean;
+  authKind: SourceAuthKind;
+  authConfiguredOnServer: boolean;
+  authHint?: string;
+  authDocsUrl?: string;
+}
+
+export type SourceVerificationStatus =
+  | 'verified'
+  | 'zipped_only'
+  | 'auth_required'
+  | 'incompatible'
+  | 'error'
+  | 'untested';
+
+export interface SourceVerificationResult {
+  status: SourceVerificationStatus;
+  streamable: boolean;
+  audioFileCount: number;
+  sampleRateHz?: number;
+  numChannels?: number;
+  formats: string[];
+  supportsRange: boolean;
+  sampleFileName?: string;
+  message: string;
+}
+
+export interface DiscoveredSourceCandidate {
+  candidateId: string;
+  providerId: string;
+  providerLabel: string;
+  title: string;
+  description: string;
+  homepageUrl?: string;
+  license?: string;
+  tags: string[];
+  authRequired: boolean;
+  authKind: SourceAuthKind;
+  authHint?: string;
+  authDocsUrl?: string;
+  connectRequest: CreateSourceRequest;
+  verification: SourceVerificationResult;
+}
+
+export interface DiscoverSourcesRequest {
+  prompt: string;
+  providerIds?: string[];
+  providerKeys?: Record<string, string>;
+  verifyTopN?: number;
+  limit?: number;
+  geminiApiKey?: string;
+}
+
+export interface DiscoverSourcesResponse {
+  prompt: string;
+  normalizedTerms: string[];
+  providersQueried: string[];
+  candidates: DiscoveredSourceCandidate[];
+  warnings: string[];
 }
 
 export interface BrowseEntry {

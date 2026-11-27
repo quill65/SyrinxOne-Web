@@ -13,10 +13,14 @@ import type {
   DataSourceInfo,
   DetectSoundsRequest,
   DetectSoundsResponse,
+  DiscoveryProviderInfo,
+  DiscoverSourcesRequest,
+  DiscoverSourcesResponse,
   DisplaySettings,
   HttpAudioEngineClient,
   MeasureSelectionRequest,
   SelectionMeasurements,
+  SourceVerificationResult,
   SpectrogramMatrix,
   SpectrogramParams,
   WaveformOverview,
@@ -675,6 +679,15 @@ export class CombinedEngineProxy implements AudioEngineClient {
   }
   listSources(): Promise<DataSourceInfo[]> {
     return this.inner.listSources();
+  }
+  listDiscoveryProviders(): Promise<DiscoveryProviderInfo[]> {
+    return this.inner.listDiscoveryProviders();
+  }
+  discoverSources(req: DiscoverSourcesRequest): Promise<DiscoverSourcesResponse> {
+    return this.inner.discoverSources(req);
+  }
+  verifySource(req: CreateSourceRequest): Promise<SourceVerificationResult> {
+    return this.inner.verifySource(req);
   }
   addSource(req: CreateSourceRequest): Promise<DataSourceInfo> {
     return this.inner.addSource(req);

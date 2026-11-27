@@ -14,9 +14,13 @@ import type {
   DataSourceInfo,
   DetectSoundsRequest,
   DetectSoundsResponse,
+  DiscoverSourcesRequest,
+  DiscoverSourcesResponse,
+  DiscoveryProviderInfo,
   DisplaySettings,
   MeasureSelectionRequest,
   SelectionMeasurements,
+  SourceVerificationResult,
   SpectrogramMatrix,
   SpectrogramParams,
   WaveformOverview,
@@ -30,6 +34,9 @@ export interface EngineConfig {
 export interface AudioEngineClient {
   health(): Promise<{ status: string; version: string }>;
   listSources(): Promise<DataSourceInfo[]>;
+  listDiscoveryProviders(): Promise<DiscoveryProviderInfo[]>;
+  discoverSources(req: DiscoverSourcesRequest): Promise<DiscoverSourcesResponse>;
+  verifySource(req: CreateSourceRequest): Promise<SourceVerificationResult>;
   addSource(req: CreateSourceRequest): Promise<DataSourceInfo>;
   removeSource(sourceId: string): Promise<{ removed: string }>;
   browseSource(sourceId: string, prefix?: string, limit?: number): Promise<BrowseEntry[]>;
@@ -257,6 +264,24 @@ export class HttpAudioEngineClient implements AudioEngineClient {
 
   async listSources(): Promise<DataSourceInfo[]> {
     return this.requestJson('/api/sources');
+  }
+
+  async listDiscoveryProviders(): Promise<DiscoveryProviderInfo[]> {
+    return this.requestJson('/api/sources/providers');
+  }
+
+  async discoverSources(req: DiscoverSourcesRequest): Promise<DiscoverSourcesResponse> {
+    return this.requestJson('/api/sources/discover', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    });
+  }
+
+  async verifySource(req: CreateSourceRequest): Promise<SourceVerificationResult> {
+    return this.requestJson('/api/sources/verify', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    });
   }
 
   async addSource(req: CreateSourceRequest): Promise<DataSourceInfo> {
