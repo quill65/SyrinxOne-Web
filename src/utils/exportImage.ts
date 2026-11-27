@@ -1,4 +1,10 @@
-import type { DisplaySettings, SpectrogramMatrix, TimeFreqRange } from '@syrinxone/shared';
+import {
+  SPECTROGRAM_BASE_FLOOR_DB,
+  SPECTROGRAM_SPAN_DB,
+  type DisplaySettings,
+  type SpectrogramMatrix,
+  type TimeFreqRange,
+} from '@syrinxone/shared';
 import { buildColormapRGBA } from '../components/spectrogram/colormaps';
 
 function renderSingleRowIntoCanvas(
@@ -13,7 +19,7 @@ function renderSingleRowIntoCanvas(
   plotW: number,
   plotH: number,
 ): void {
-  const dyn = Math.max(1, display.dynamicRangeDb);
+  const floorNorm = Math.max(0, Math.min(0.95, display.floor / 100));
   const totalT = Math.max(1e-6, matrix.endSec - matrix.startSec);
   const totalF = Math.max(1e-6, matrix.maxFreqHz - matrix.minFreqHz);
 
@@ -30,7 +36,11 @@ function renderSingleRowIntoCanvas(
       const ti = Math.max(0, Math.min(matrix.numTimeBins - 1, Math.round(tNorm * (matrix.numTimeBins - 1))));
 
       const val = matrix.data[ti * matrix.numFreqBins + fi];
-      const norm = Math.max(0, Math.min(1, (val + display.gainDb - display.thresholdDb) / dyn));
+      const level = Math.max(
+        0,
+        Math.min(1, (val + display.gainDb - SPECTROGRAM_BASE_FLOOR_DB) / SPECTROGRAM_SPAN_DB),
+      );
+      const norm = floorNorm > 0 && level < floorNorm ? 0 : level;
       const lutIdx = Math.round(norm * 255) * 4;
       const dstIdx = (py * plotW + px) * 4;
       imgData.data[dstIdx] = lut[lutIdx];

@@ -1,9 +1,15 @@
-import type {
-  AudioEngineClient,
-  AudioFileInfo,
-  DisplaySettings,
-  SpectrogramMatrix,
-  SpectrogramParams,
+import {
+  SPECTROGRAM_BASE_FLOOR_DB,
+  SPECTROGRAM_FLOOR_MAX,
+  SPECTROGRAM_FLOOR_MIN,
+  SPECTROGRAM_GAIN_MAX_DB,
+  SPECTROGRAM_GAIN_MIN_DB,
+  SPECTROGRAM_SPAN_DB,
+  type AudioEngineClient,
+  type AudioFileInfo,
+  type DisplaySettings,
+  type SpectrogramMatrix,
+  type SpectrogramParams,
 } from '@syrinxone/shared';
 
 export type AutoGainMode = 'manual' | 'auto';
@@ -12,11 +18,10 @@ export function normalizeAutoGainMode(mode: unknown): AutoGainMode {
   return mode === 'auto' || mode === 'auto_full' || mode === 'auto_view' ? 'auto' : 'manual';
 }
 
-export interface NormalizedGainResult {
-  thresholdDb: number;
-  dynamicRangeDb: number;
+export interface AutoGainResult {
   gainDb: number;
-  floorDb: number;
+  floor: number;
+  noiseDb: number;
   peakDb: number;
 }
 
@@ -253,20 +258,23 @@ function quantile(sorted: number[], q: number): number {
 }
 
 /**
- * Compute optimal display contrast & gain (thresholdDb, dynamicRangeDb, gainDb)
- * mapping the background noise floor cleanly to 0.0 and vocalization peaks near 1.0.
+ * Auto Gain: compute optimal Gain (dB) and Floor (%) for a bioacoustic spectrogram
+ * so target signals reach high clarity while stationary background noise snaps cleanly away.
  */
-export function computeNormalizedGainDb(
+export function computeAutoGain(
   matrix: SpectrogramMatrix,
-  display: Pick<DisplaySettings, 'gainDb' | 'thresholdDb' | 'dynamicRangeDb'>,
+  display: Pick<DisplaySettings, 'gainDb' | 'floor'>,
   region?: { startSec: number; endSec: number; minFreqHz: number; maxFreqHz: number },
-): NormalizedGainResult {
+): AutoGainResult {
   const { numTimeBins, numFreqBins, data } = matrix;
-  const fallback: NormalizedGainResult = {
-    thresholdDb: Math.round(Math.max(-120, Math.min(-10, display.thresholdDb))),
-    dynamicRangeDb: Math.round(Math.max(15, Math.min(120, display.dynamicRangeDb))),
-    gainDb: Math.round(Math.max(-40, Math.min(60, display.gainDb))),
-    floorDb: matrix.minValue,
+  const fallback: AutoGainResult = {
+    gainDb: Math.round(
+      Math.max(SPECTROGRAM_GAIN_MIN_DB, Math.min(SPECTROGRAM_GAIN_MAX_DB, display.gainDb)),
+    ),
+    floor: Math.round(
+      Math.max(SPECTROGRAM_FLOOR_MIN, Math.min(SPECTROGRAM_FLOOR_MAX, display.floor)),
+    ),
+    noiseDb: matrix.minValue,
     peakDb: matrix.maxValue,
   };
   if (numTimeBins <= 0 || numFreqBins <= 0 || !data || data.length === 0) {
@@ -292,12 +300,18 @@ export function computeNormalizedGainDb(
     f1 = Math.max(f0 + 1, Math.min(numFreqBins, Math.ceil(((rMaxF - matrix.minFreqHz) / matSpanF) * numFreqBins)));
   }
 
+  // Skip DC bin (f === 0) when viewing a multi-bin band so DC offset / hydrophone rumble
+  // does not skew peak signal or gain estimation.
+  if (f0 === 0 && f1 - f0 > 8) {
+    f0 = 1;
+  }
+
   const subT = t1 - t0;
   const subF = f1 - f0;
   const totalCells = subT * subF;
   if (totalCells <= 0) return fallback;
 
-  const targetSamples = 12288;
+  const targetSamples = 16384;
   const tStep = Math.max(1, Math.floor(Math.sqrt(totalCells / targetSamples) * (subT / Math.max(1, subF)) ** 0.25));
   const fStep = Math.max(1, Math.floor(totalCells / (targetSamples * Math.ceil(subT / tStep))));
 
@@ -317,22 +331,53 @@ export function computeNormalizedGainDb(
   if (samples.length === 0) return fallback;
   samples.sort((a, b) => a - b);
 
-  // p35 places quiet ambient background cleanly at the colormap zero-point without turning it muddy gray,
-  // while p99.85 captures vocalization peaks cleanly with 1.5 dB headroom.
-  const floorDb = quantile(samples, 0.35);
-  const peakSignalDb = quantile(samples, 0.9985);
-  const peakDb = Math.max(floorDb + 15, peakSignalDb + 1.5);
+  // Robust background noise model from the lower half (unaffected by sparse vocalizations)
+  const q25 = quantile(samples, 0.25);
+  const noiseMed = quantile(samples, 0.5);
+  const q75 = quantile(samples, 0.75);
+  const noiseSigma = Math.max(1.5, (noiseMed - q25) / 0.6745);
+  const noiseCeilingDb = Math.max(q75 + 1.0, noiseMed + 2.0 * noiseSigma);
 
-  const desiredFloor = Math.min(floorDb, peakDb - 15);
-  const thresholdDb = Math.round(Math.max(-120, Math.min(-10, desiredFloor)));
-  const gainDb = Math.round(Math.max(-40, Math.min(60, thresholdDb - desiredFloor)));
-  const dynamicRangeDb = Math.round(Math.max(15, Math.min(120, peakDb - desiredFloor)));
+  // Target signal peak (99.6th percentile ignores isolated single-pixel clicks while capturing calls)
+  const peakSignalDb = quantile(samples, 0.996);
+
+  // 1. Anchor Gain to the background noise ceiling so noise sits naturally at ~2% (level ≈ 0.02)
+  //    instead of lifting noise high and forcing a harsh speckled Floor cutoff.
+  //    Only lift Gain further on low-SNR recordings so target peaks reach at least 0.55 clarity,
+  //    and cap so peaks stay below 0.92 (preventing over-saturation).
+  const targetNoiseNorm = 0.02;
+  const gainFromNoise =
+    targetNoiseNorm * SPECTROGRAM_SPAN_DB + SPECTROGRAM_BASE_FLOOR_DB - noiseCeilingDb;
+  const minGainForSignal =
+    0.55 * SPECTROGRAM_SPAN_DB + SPECTROGRAM_BASE_FLOOR_DB - peakSignalDb;
+  const maxGainNoClip =
+    0.92 * SPECTROGRAM_SPAN_DB + SPECTROGRAM_BASE_FLOOR_DB - peakSignalDb;
+
+  const rawGainDb = Math.min(maxGainNoClip, Math.max(minGainForSignal, gainFromNoise));
+  const gainDb = Math.round(
+    Math.max(SPECTROGRAM_GAIN_MIN_DB, Math.min(SPECTROGRAM_GAIN_MAX_DB, rawGainDb)),
+  );
+
+  // 2. Place Floor gently right at the gained noise ceiling (~2% for normal/high-SNR recordings,
+  //    higher only when low-SNR gain boost lifts background noise above zero).
+  const peakLevel = Math.max(
+    0,
+    Math.min(1, (peakSignalDb + gainDb - SPECTROGRAM_BASE_FLOOR_DB) / SPECTROGRAM_SPAN_DB),
+  );
+  const noiseLevel = Math.max(
+    0,
+    Math.min(1, (noiseCeilingDb + gainDb - SPECTROGRAM_BASE_FLOOR_DB) / SPECTROGRAM_SPAN_DB),
+  );
+  const maxSafeFloorNorm = Math.max(0, Math.min(0.75, peakLevel - 0.18));
+  const desiredFloorNorm = noiseLevel <= 0.005 ? 0 : Math.min(noiseLevel, maxSafeFloorNorm);
+  const floor = Math.round(
+    Math.max(SPECTROGRAM_FLOOR_MIN, Math.min(SPECTROGRAM_FLOOR_MAX, desiredFloorNorm * 100)),
+  );
 
   return {
-    thresholdDb,
-    dynamicRangeDb,
     gainDb,
-    floorDb,
+    floor,
+    noiseDb: noiseMed,
     peakDb: peakSignalDb,
   };
 }

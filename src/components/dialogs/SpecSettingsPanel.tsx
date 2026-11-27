@@ -1,6 +1,15 @@
 import React from 'react';
 import { SlidersHorizontal, X } from 'lucide-react';
-import type { ColormapName, RenderMode, TimeScaleMode, WindowType } from '@syrinxone/shared';
+import {
+  SPECTROGRAM_FLOOR_MAX,
+  SPECTROGRAM_FLOOR_MIN,
+  SPECTROGRAM_GAIN_MAX_DB,
+  SPECTROGRAM_GAIN_MIN_DB,
+  type ColormapName,
+  type RenderMode,
+  type TimeScaleMode,
+  type WindowType,
+} from '@syrinxone/shared';
 import { useWorkspaceStore } from '../../store/workspaceStore';
 import { MeasurementInspector } from '../panels/MeasurementInspector';
 
@@ -13,7 +22,6 @@ export const SpecSettingsPanel: React.FC = () => {
   const applySettingsToAllWindows = useWorkspaceStore((s) => s.applySettingsToAllWindows);
   const makeActiveSettingsDefault = useWorkspaceStore((s) => s.makeActiveSettingsDefault);
   const setWindowAutoGainMode = useWorkspaceStore((s) => s.setWindowAutoGainMode);
-  const normalizeWindowGain = useWorkspaceStore((s) => s.normalizeWindowGain);
   const windowAutoGainMode = useWorkspaceStore((s) => s.windowAutoGainMode);
   const setModalState = useWorkspaceStore((s) => s.setModalState);
 
@@ -98,92 +106,59 @@ export const SpecSettingsPanel: React.FC = () => {
         </div>
 
         <div className="field-group">
-          <label>Contrast Normalization</label>
-          <div className="field-inline-row" style={{ justifyContent: 'space-between' }}>
-            <button
-              type="button"
-              className={`btn-small ${autoGainMode === 'auto' ? 'btn-active' : 'btn-primary'}`}
-              style={{ flex: 1, justifyContent: 'center' }}
-              onClick={() =>
-                normalizeWindowGain(activeWin.windowId, {
-                  scope: activeWin.selection ? 'selection' : 'view',
-                })
-              }
-            >
-              {activeWin.selection ? 'Normalize Selection' : 'Normalize View'}
-            </button>
-            <label
-              className="inline-check"
-              style={{ fontSize: 12, color: 'var(--text)', flexShrink: 0 }}
-              title="Auto-normalize contrast on load, zoom & pan"
-            >
-              <input
-                type="checkbox"
-                checked={autoGainMode === 'auto'}
-                onChange={(e) =>
-                  setWindowAutoGainMode(activeWin.windowId, e.target.checked ? 'auto' : 'manual')
-                }
-              />
-              Auto
-            </label>
-          </div>
+          <button
+            type="button"
+            className={`btn-small ${autoGainMode === 'auto' ? 'btn-active' : ''}`}
+            style={{ width: '100%', justifyContent: 'space-between' }}
+            onClick={() =>
+              setWindowAutoGainMode(activeWin.windowId, autoGainMode === 'auto' ? 'manual' : 'auto')
+            }
+            aria-pressed={autoGainMode === 'auto'}
+            title="Toggle Auto Gain (Alt+A) — automatically sets Gain & Floor to emphasize signal and minimize noise"
+          >
+            <span>Auto Gain (Alt+A)</span>
+            <strong>{autoGainMode === 'auto' ? 'ON' : 'OFF'}</strong>
+          </button>
         </div>
 
         <div className="field-group">
           <label>
-            Gain
+            Gain (Alt+↑/↓)
             <span>
-              {disp.gainDb.toFixed(0)} dB{autoGainMode === 'auto' ? ' · Auto' : ''}
+              {disp.gainDb >= 0 ? `+${disp.gainDb.toFixed(0)}` : disp.gainDb.toFixed(0)} dB
+              {autoGainMode === 'auto' ? ' · Auto' : ''}
             </span>
           </label>
           <input
             type="range"
-            min={-40}
-            max={60}
+            min={SPECTROGRAM_GAIN_MIN_DB}
+            max={SPECTROGRAM_GAIN_MAX_DB}
             step={1}
             value={disp.gainDb}
             onChange={(e) =>
               updateWindowDisplaySettings(activeWin.windowId, { gainDb: Number(e.target.value) })
             }
+            title="Adjust signal intensity (Alt+Up darker/brighter, Alt+Down lighter)"
           />
         </div>
 
-        <div className="settings-pair-grid">
-          <div className="field-group">
-            <label>
-              Floor <span>{disp.thresholdDb.toFixed(0)} dB</span>
-            </label>
-            <input
-              type="range"
-              min={-120}
-              max={-10}
-              step={1}
-              value={disp.thresholdDb}
-              onChange={(e) =>
-                updateWindowDisplaySettings(activeWin.windowId, {
-                  thresholdDb: Number(e.target.value),
-                })
-              }
-            />
-          </div>
-
-          <div className="field-group">
-            <label>
-              Range <span>{disp.dynamicRangeDb.toFixed(0)} dB</span>
-            </label>
-            <input
-              type="range"
-              min={15}
-              max={120}
-              step={1}
-              value={disp.dynamicRangeDb}
-              onChange={(e) =>
-                updateWindowDisplaySettings(activeWin.windowId, {
-                  dynamicRangeDb: Number(e.target.value),
-                })
-              }
-            />
-          </div>
+        <div className="field-group">
+          <label>
+            Floor (Alt+Shift+↑/↓) <span>{disp.floor.toFixed(0)}%</span>
+          </label>
+          <input
+            type="range"
+            min={SPECTROGRAM_FLOOR_MIN}
+            max={SPECTROGRAM_FLOOR_MAX}
+            step={1}
+            value={disp.floor}
+            onChange={(e) =>
+              updateWindowDisplaySettings(activeWin.windowId, {
+                floor: Number(e.target.value),
+              })
+            }
+            title="Background noise cutoff — energy below Floor snaps cleanly to pure background without dimming target signal"
+          />
         </div>
 
         <hr className="panel-divider" />

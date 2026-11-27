@@ -1,5 +1,11 @@
 import React, { useEffect, useRef } from 'react';
-import type { DisplaySettings, SpectrogramMatrix, TimeFreqRange } from '@syrinxone/shared';
+import {
+  SPECTROGRAM_BASE_FLOOR_DB,
+  SPECTROGRAM_SPAN_DB,
+  type DisplaySettings,
+  type SpectrogramMatrix,
+  type TimeFreqRange,
+} from '@syrinxone/shared';
 import { downsampleSpectrogramTime } from '../../utils/spectrogramFetch';
 import { buildColormapRGBA } from './colormaps';
 
@@ -42,8 +48,9 @@ uniform sampler2D u_lutTex;
 uniform vec2 u_timeUvRange;   // (u0, u1) normalized into spectrogram matrix [0..1]
 uniform vec2 u_freqUvRange;   // (v0, v1) normalized into spectrogram matrix [0..1]
 uniform float u_gainDb;
-uniform float u_thresholdDb;
-uniform float u_dynamicRangeDb;
+uniform float u_floorNorm;    // 0.0..0.95 background cutoff threshold
+uniform float u_baseFloorDb;
+uniform float u_spanDb;
 
 void main() {
   // Spectrogram texture layout: width = numFreqBins (x), height = numTimeBins (y)
@@ -57,7 +64,8 @@ void main() {
   }
 
   float val = texture(u_specTex, vec2(fNorm, tNorm)).r;
-  float norm = clamp((val + u_gainDb - u_thresholdDb) / max(1.0, u_dynamicRangeDb), 0.0, 1.0);
+  float level = clamp((val + u_gainDb - u_baseFloorDb) / max(1.0, u_spanDb), 0.0, 1.0);
+  float norm = (u_floorNorm > 0.0 && level < u_floorNorm) ? 0.0 : level;
   outColor = texture(u_lutTex, vec2(norm, 0.5));
 }`;
 
@@ -83,8 +91,9 @@ interface GlResources {
   uTime: WebGLUniformLocation | null;
   uFreq: WebGLUniformLocation | null;
   uGain: WebGLUniformLocation | null;
-  uThresh: WebGLUniformLocation | null;
-  uDyn: WebGLUniformLocation | null;
+  uFloor: WebGLUniformLocation | null;
+  uBaseFloor: WebGLUniformLocation | null;
+  uSpan: WebGLUniformLocation | null;
 }
 
 export const WebGLSpectrogramCanvas: React.FC<Props> = ({
@@ -173,8 +182,9 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
       uTime: gl.getUniformLocation(program, 'u_timeUvRange'),
       uFreq: gl.getUniformLocation(program, 'u_freqUvRange'),
       uGain: gl.getUniformLocation(program, 'u_gainDb'),
-      uThresh: gl.getUniformLocation(program, 'u_thresholdDb'),
-      uDyn: gl.getUniformLocation(program, 'u_dynamicRangeDb'),
+      uFloor: gl.getUniformLocation(program, 'u_floorNorm'),
+      uBaseFloor: gl.getUniformLocation(program, 'u_baseFloorDb'),
+      uSpan: gl.getUniformLocation(program, 'u_spanDb'),
     };
     uploadedColormapRef.current = null;
 
@@ -252,8 +262,9 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
     gl.useProgram(res.program);
     gl.bindVertexArray(res.vao);
     gl.uniform1f(res.uGain, displaySettings.gainDb);
-    gl.uniform1f(res.uThresh, displaySettings.thresholdDb);
-    gl.uniform1f(res.uDyn, displaySettings.dynamicRangeDb);
+    gl.uniform1f(res.uFloor, Math.max(0, Math.min(0.95, displaySettings.floor / 100)));
+    gl.uniform1f(res.uBaseFloor, SPECTROGRAM_BASE_FLOOR_DB);
+    gl.uniform1f(res.uSpan, SPECTROGRAM_SPAN_DB);
     gl.enable(gl.SCISSOR_TEST);
 
     for (const row of effectiveRows) {

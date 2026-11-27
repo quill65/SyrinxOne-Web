@@ -11,15 +11,15 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@google/genai": "^3.6.1",
-    "@types/express": "^5.0.6",
-    "express": "^5.3.0",
     "firebase": "^13.4.0",
     "lucide-react": "^0.469.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "tsx": "^4.23.15",
-    "zustand": "^5.0.3"
+    "zustand": "^5.0.3",
+    "@google/genai": "^3.6.1",
+    "@types/express": "^5.0.6",
+    "express": "^5.3.0",
+    "tsx": "^4.23.15"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

@@ -145,15 +145,21 @@ export interface SpectrogramParams {
   windowType: WindowType;
   dspMode: DspMode;
   popFilter: boolean;
-  classicGain: number;
-  classicWhiteThresh: number;
 }
+
+export const SPECTROGRAM_BASE_FLOOR_DB = -80;
+export const SPECTROGRAM_SPAN_DB = 60;
+export const SPECTROGRAM_GAIN_MIN_DB = -60;
+export const SPECTROGRAM_GAIN_MAX_DB = 80;
+export const SPECTROGRAM_FLOOR_MIN = 0;
+export const SPECTROGRAM_FLOOR_MAX = 95;
 
 export interface DisplaySettings {
   colormap: ColormapName;
+  /** Gain shift in dB (-60..+80) moving target signal across the display window */
   gainDb: number;
-  thresholdDb: number;
-  dynamicRangeDb: number;
+  /** Background cutoff threshold (0..95%): levels below Floor snap cleanly to pure background */
+  floor: number;
   renderMode: RenderMode;
   timeScaleMode: TimeScaleMode;
   /** Milliseconds per horizontal pixel when timeScaleMode === 'fixed' */
@@ -252,15 +258,12 @@ export const DEFAULT_SPECTROGRAM_PARAMS: SpectrogramParams = {
   windowType: 'hann',
   dspMode: 'modern_stft',
   popFilter: false,
-  classicGain: 1,
-  classicWhiteThresh: 0,
 };
 
 export const DEFAULT_DISPLAY_SETTINGS: DisplaySettings = {
   colormap: 'grayscale_bow',
   gainDb: 0,
-  thresholdDb: -80,
-  dynamicRangeDb: 75,
+  floor: 0,
   renderMode: 'webgl_float32',
   timeScaleMode: 'stretch',
   msPerPixel: 4.0,

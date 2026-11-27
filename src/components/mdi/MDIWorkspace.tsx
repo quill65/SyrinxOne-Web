@@ -1,10 +1,12 @@
 import React, { useEffect, useRef } from 'react';
-import { Database, FolderOpen, Plus, X } from 'lucide-react';
+import { Database, FolderOpen, Plus, Sparkles, X } from 'lucide-react';
+import { SPECTROGRAM_GAIN_MAX_DB, SPECTROGRAM_GAIN_MIN_DB } from '@syrinxone/shared';
 import { useWorkspaceStore } from '../../store/workspaceStore';
 import { MDIChildWindow } from './MDIChildWindow';
 import { SpectrogramView } from '../spectrogram/SpectrogramView';
 
 const MOBILE_TAB_HEIGHT = 32;
+const MOBILE_GAIN_BAR_HEIGHT = 30;
 
 export const MDIWorkspace: React.FC = () => {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -16,6 +18,9 @@ export const MDIWorkspace: React.FC = () => {
   const setCanvasBounds = useWorkspaceStore((s) => s.setCanvasBounds);
   const focusWindow = useWorkspaceStore((s) => s.focusWindow);
   const closeWindow = useWorkspaceStore((s) => s.closeWindow);
+  const updateWindowDisplaySettings = useWorkspaceStore((s) => s.updateWindowDisplaySettings);
+  const windowAutoGainMode = useWorkspaceStore((s) => s.windowAutoGainMode);
+  const setWindowAutoGainMode = useWorkspaceStore((s) => s.setWindowAutoGainMode);
   const openUploadedFile = useWorkspaceStore((s) => s.openUploadedFile);
   const importAnnotationsFromText = useWorkspaceStore((s) => s.importAnnotationsFromText);
   const setModalState = useWorkspaceStore((s) => s.setModalState);
@@ -117,12 +122,46 @@ export const MDIWorkspace: React.FC = () => {
               <Plus size={13} />
             </button>
           </div>
+          <div className="mobile-gain-bar">
+            <span className="mobile-gain-label">Gain</span>
+            <input
+              type="range"
+              className="mobile-gain-slider"
+              min={SPECTROGRAM_GAIN_MIN_DB}
+              max={SPECTROGRAM_GAIN_MAX_DB}
+              step={1}
+              value={activeMobileWin.displaySettings.gainDb}
+              onChange={(e) =>
+                updateWindowDisplaySettings(activeMobileWin.windowId, {
+                  gainDb: Number(e.target.value),
+                })
+              }
+              aria-label="Spectrogram Gain"
+            />
+            <span className="mobile-gain-val">
+              {activeMobileWin.displaySettings.gainDb >= 0
+                ? `+${activeMobileWin.displaySettings.gainDb.toFixed(0)}`
+                : activeMobileWin.displaySettings.gainDb.toFixed(0)}{' '}
+              dB
+            </span>
+            <button
+              type="button"
+              className={`mobile-auto-gain-btn ${(windowAutoGainMode[activeMobileWin.windowId] ?? 'manual') === 'auto' ? 'btn-active' : ''}`}
+              onClick={() => {
+                const cur = windowAutoGainMode[activeMobileWin.windowId] ?? 'manual';
+                setWindowAutoGainMode(activeMobileWin.windowId, cur === 'auto' ? 'manual' : 'auto');
+              }}
+              title="Toggle Auto Gain"
+            >
+              <Sparkles size={12} /> Auto
+            </button>
+          </div>
           <div className="mobile-spec-stage">
             <SpectrogramView
               win={activeMobileWin}
               file={activeMobileFile}
               width={Math.max(240, canvasBounds.width)}
-              height={Math.max(200, canvasBounds.height - MOBILE_TAB_HEIGHT)}
+              height={Math.max(200, canvasBounds.height - MOBILE_TAB_HEIGHT - MOBILE_GAIN_BAR_HEIGHT)}
             />
           </div>
         </div>

@@ -82,6 +82,8 @@ export const App: React.FC = () => {
   const toggleAllCursors = useWorkspaceStore((s) => s.toggleAllCursors);
   const toggleTimeScaleMode = useWorkspaceStore((s) => s.toggleTimeScaleMode);
   const nudgeWindowGain = useWorkspaceStore((s) => s.nudgeWindowGain);
+  const nudgeWindowFloor = useWorkspaceStore((s) => s.nudgeWindowFloor);
+  const autoGainWindow = useWorkspaceStore((s) => s.autoGainWindow);
   const resetWindowZoom = useWorkspaceStore((s) => s.resetWindowZoom);
   const gotoTimeInWindow = useWorkspaceStore((s) => s.gotoTimeInWindow);
   const stepFileInFolder = useWorkspaceStore((s) => s.stepFileInFolder);
@@ -382,12 +384,20 @@ export const App: React.FC = () => {
       if (e.altKey && !e.ctrlKey && curWinId) {
         if (e.key === 'ArrowUp') {
           e.preventDefault();
-          nudgeWindowGain(curWinId, 4);
+          if (e.shiftKey) nudgeWindowFloor(curWinId, 3);
+          else nudgeWindowGain(curWinId, 3);
           return;
         }
         if (e.key === 'ArrowDown') {
           e.preventDefault();
-          nudgeWindowGain(curWinId, -4);
+          if (e.shiftKey) nudgeWindowFloor(curWinId, -3);
+          else nudgeWindowGain(curWinId, -3);
+          return;
+        }
+        if (e.key.toLowerCase() === 'a') {
+          e.preventDefault();
+          const curWin = windows.find((w) => w.windowId === curWinId);
+          autoGainWindow(curWinId, { scope: curWin?.selection ? 'selection' : 'view' });
           return;
         }
         if (e.key === 'ArrowLeft') {
@@ -456,6 +466,8 @@ export const App: React.FC = () => {
     deleteAnnotation,
     navigateAnnotation,
     nudgeWindowGain,
+    nudgeWindowFloor,
+    autoGainWindow,
     stepFileInFolder,
     toggleTimeScaleMode,
     toggleAllCursors,
@@ -475,6 +487,7 @@ export const App: React.FC = () => {
       target &&
       (target.closest('input, select, textarea') ||
         target.closest('.mobile-tab-strip') ||
+        target.closest('.mobile-gain-bar') ||
         target.closest('.archive-bar-scrubber') ||
         target.closest('.spec-scrollbar-wrap'))
     ) {

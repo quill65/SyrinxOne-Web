@@ -2644,3 +2644,89 @@ body,
 
 
 
+
+/* Per-window inline Gain slider (Desktop MDI titlebar & Mobile single-pane bar) */
+.mdi-gain-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 5px;
+  margin-right: 4px;
+  height: 20px;
+  border-radius: 4px;
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid var(--border);
+}
+
+.mdi-gain-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+.mdi-gain-slider {
+  width: 68px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}
+
+.mdi-gain-val {
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+  min-width: 24px;
+  text-align: right;
+  user-select: none;
+}
+
+.mobile-gain-bar {
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  background: var(--bg-chrome);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.mobile-gain-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.mobile-gain-slider {
+  flex: 1;
+  min-width: 80px;
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+.mobile-gain-val {
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+  min-width: 40px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.mobile-auto-gain-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--accent-hover);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+}

@@ -151,7 +151,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
   const setStatus = useWorkspaceStore((s) => s.setStatus);
   const setError = useWorkspaceStore((s) => s.setError);
   const autoGainMode = useWorkspaceStore((s) => s.windowAutoGainMode[win.windowId] ?? 'manual');
-  const normalizeWindowGain = useWorkspaceStore((s) => s.normalizeWindowGain);
+  const autoGainWindow = useWorkspaceStore((s) => s.autoGainWindow);
 
   const [playback, setPlayback] = useState<PlaybackState>(() => audioPlayer.getState());
   const [cursorStyle, setCursorStyle] = useState<string>('crosshair');
@@ -369,10 +369,10 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     activeMatricesByChannel[displayedChannels[0]] ??
     primaryOverviewMatrix;
 
-  // Keep contrast normalized to visible viewport when Auto-normalize is enabled
+  // Keep Gain & Floor tuned to visible viewport when Auto Gain is enabled
   useEffect(() => {
     if (autoGainMode !== 'auto' || !primaryRenderMatrix) return;
-    normalizeWindowGain(win.windowId, {
+    autoGainWindow(win.windowId, {
       scope: 'view',
       matrix: primaryRenderMatrix,
       silent: true,
@@ -380,7 +380,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
   }, [
     autoGainMode,
     primaryRenderMatrix,
-    normalizeWindowGain,
+    autoGainWindow,
     win.windowId,
     win.viewRange.startSec,
     win.viewRange.endSec,
@@ -1646,14 +1646,14 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
           </button>
           <button
             onClick={() => {
-              normalizeWindowGain(win.windowId, {
+              autoGainWindow(win.windowId, {
                 scope: win.selection ? 'selection' : 'view',
                 matrix: primaryRenderMatrix,
               });
               setContextMenu(null);
             }}
           >
-            {win.selection ? 'Normalize Contrast (Selection)' : 'Normalize Contrast (View)'}
+            {win.selection ? 'Auto Gain (Selection)' : 'Auto Gain (View)'}
           </button>
 
           <hr />

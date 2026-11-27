@@ -391,8 +391,6 @@ export class HttpAudioEngineClient implements AudioEngineClient {
       window_type: params.windowType,
       dsp_mode: 'modern_stft',
       pop_filter: String(params.popFilter),
-      classic_gain: '1',
-      classic_white_thresh: '0',
     });
     if (range?.startSec !== undefined) q.set('start_sec', String(range.startSec));
     if (range?.endSec !== undefined) q.set('end_sec', String(range.endSec));
@@ -457,12 +455,9 @@ export class HttpAudioEngineClient implements AudioEngineClient {
       window_type: params.windowType,
       dsp_mode: 'modern_stft',
       pop_filter: String(params.popFilter),
-      classic_gain: '1',
-      classic_white_thresh: '0',
       colormap: display.colormap,
       gain_db: String(display.gainDb),
-      threshold_db: String(display.thresholdDb),
-      dynamic_range_db: String(display.dynamicRangeDb),
+      floor: String(display.floor),
     });
     if (range?.startSec !== undefined) q.set('start_sec', String(range.startSec));
     if (range?.endSec !== undefined) q.set('end_sec', String(range.endSec));
