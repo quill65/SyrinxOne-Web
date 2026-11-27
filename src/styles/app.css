@@ -3563,3 +3563,149 @@ body,
   color: var(--text-muted);
   flex-shrink: 0;
 }
+
+
+/* Compact 2-Row Sources Dialog */
+.src-utility-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.src-utility-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.src-compact-drawer {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-root);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.src-compact-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.src-row-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  background: var(--bg-root);
+  border: 1px solid var(--border);
+}
+
+.src-row-card.clickable {
+  cursor: pointer;
+}
+
+.src-row-card.clickable:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-active);
+}
+
+.src-row-card.active {
+  border-color: var(--accent);
+  background: rgba(14, 165, 233, 0.1);
+}
+
+.src-row-1 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.src-row-icon {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.src-row-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.src-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.src-row-2 {
+  padding-left: 21px;
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.src-row-details {
+  margin-top: 5px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.src-detail-desc {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: #cbd5e1;
+}
+
+.src-detail-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.src-detail-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.src-inline-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: #7dd3fc;
+  text-decoration: none;
+}
+
+.src-inline-link:hover {
+  text-decoration: underline;
+}
+
+.src-empty-recent {
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--bg-root);
+  border: 1px dashed var(--border);
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
