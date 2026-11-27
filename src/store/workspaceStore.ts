@@ -794,7 +794,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
   },
 
   restoreSavedRecordingView: async (saved) => {
-    if (saved.kind === 'combined' && saved.segments && saved.segments.length > 1) {
+    const hasMulti =
+      saved.segments &&
+      (saved.segments.length > 1 || (saved.segments[0]?.channelFiles?.length ?? 0) > 1);
+    if (saved.kind === 'combined' && saved.segments && hasMulti) {
       await get().openCombinedArchive(saved.segments, saved.label, {
         recordingKey: saved.recordingKey,
         restoreSaved: true,

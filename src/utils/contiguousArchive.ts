@@ -32,6 +32,8 @@ export interface SegmentSourceSpec {
   name: string;
   sizeBytes?: number;
   folderName?: string;
+  /** Optional synchronized per-channel files (e.g. CH1..CH6) stacked as virtual channels 0..K-1. */
+  channelFiles?: SegmentSourceSpec[];
 }
 
 export interface SavedRecordingViewState {
@@ -489,12 +491,14 @@ export function makeSingleRecordingKey(sourceId: string, uri: string): string {
 
 export function makeCombinedRecordingKey(
   sourceId: string,
-  specs: Array<{ uri: string }>,
+  specs: Array<{ uri: string; channelFiles?: Array<{ uri: string }> }>,
 ): string {
   if (specs.length === 0) return `combined::${sourceId}::empty`;
   const first = specs[0].uri;
   const last = specs[specs.length - 1].uri;
-  return `combined::${sourceId}::${specs.length}::${first}..${last}`;
+  const chCount = specs[0].channelFiles?.length ?? 0;
+  const chTag = chCount > 1 ? `::ch${chCount}` : '';
+  return `combined::${sourceId}::${specs.length}${chTag}::${first}..${last}`;
 }
 
 export function getArchiveCombinePref(seriesKey: string): CombineDecision | null {

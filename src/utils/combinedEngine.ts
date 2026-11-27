@@ -52,6 +52,8 @@ export interface CombinedSegment {
   name: string;
   folderName?: string;
   sizeBytes?: number;
+  /** Parallel per-channel source files stacked as virtual channels 0..K-1. */
+  channelFiles?: SegmentSourceSpec[];
   durationSec: number;
   probed: boolean;
   sampleRate: number;
@@ -78,6 +80,7 @@ export interface CombinedRecording {
   uri: string;
   sampleRate: number;
   numChannels: number;
+  hasVirtualChannels?: boolean;
   format: string;
   subtype: string;
   startDateTimeIso?: string | null;
@@ -86,10 +89,10 @@ export interface CombinedRecording {
   windowStartSec: number;
   windowDurationSec: number;
   isPartialWindow: boolean;
-  openSlices: Map<number, OpenedSliceCache>;
+  openSlices: Map<string, OpenedSliceCache>;
 }
 
-const MAX_OPEN_SLICES_PER_COMBINED = 4;
+const MAX_OPEN_SLICES_PER_COMBINED = 12;
 
 export function isCombinedFileId(fileId: string | null | undefined): boolean {
   return typeof fileId === 'string' && fileId.startsWith('combined::');
@@ -434,7 +437,7 @@ export class CombinedEngineProxy implements AudioEngineClient {
       openSlices: new Map(),
     };
     const sliceStart = info.windowStartSec ?? 0;
-    rec.openSlices.set(0, {
+    rec.openSlices.set('0:0', {
       fileInfo: info,
       sliceStartSec: sliceStart,
       sliceEndSec: sliceStart + info.durationSec,
@@ -443,6 +446,33 @@ export class CombinedEngineProxy implements AudioEngineClient {
 
     this.combinedMap.set(combinedId, rec);
     return this.toAudioFileInfo(rec);
+  }
+
+  private resolveSegmentTarget(
+    rec: CombinedRecording,
+    seg: CombinedSegment,
+    virtualChannel: number,
+  ): { sourceId: string; uri: string; name: string; sizeBytes?: number; innerChannel: number; cacheKey: string } {
+    if (rec.hasVirtualChannels && seg.channelFiles && seg.channelFiles.length > 0) {
+      const chIdx = Math.max(0, Math.min(seg.channelFiles.length - 1, virtualChannel));
+      const cf = seg.channelFiles[chIdx];
+      return {
+        sourceId: cf.sourceId,
+        uri: cf.uri,
+        name: cf.name,
+        sizeBytes: cf.sizeBytes,
+        innerChannel: 0,
+        cacheKey: `${seg.index}:${chIdx}`,
+      };
+    }
+    return {
+      sourceId: seg.sourceId,
+      uri: seg.uri,
+      name: seg.name,
+      sizeBytes: seg.sizeBytes,
+      innerChannel: virtualChannel,
+      cacheKey: `${seg.index}:0`,
+    };
   }
 
   public async openCombinedArchive(
@@ -454,7 +484,10 @@ export class CombinedEngineProxy implements AudioEngineClient {
     if (specs.length === 0) {
       throw new Error('No audio segments selected to combine.');
     }
-    if (specs.length === 1) {
+    const maxVirtualCh = specs.reduce((m, s) => Math.max(m, s.channelFiles?.length ?? 0), 0);
+    const hasVirtualChannels = maxVirtualCh > 1;
+
+    if (specs.length === 1 && !hasVirtualChannels) {
       return this.openCompleteAudio(specs[0].sourceId, specs[0].uri, recordingKey, {
         ...options,
         sizeBytes: specs[0].sizeBytes,
@@ -462,45 +495,49 @@ export class CombinedEngineProxy implements AudioEngineClient {
       });
     }
 
-    // Probe segment 0 with a minimal 1s slice for large files to minimize startup I/O
+    // Probe segment 0 (channel 0) with a minimal 1s slice for large files to minimize startup I/O
     const firstSpec = specs[0];
-    const smartFirstMax = getSmartArchiveWindowSec(firstSpec.name, firstSpec.sizeBytes);
+    const firstTarget = firstSpec.channelFiles?.[0] ?? firstSpec;
+    const smartFirstMax = getSmartArchiveWindowSec(firstTarget.name, firstTarget.sizeBytes);
     const firstProbeOpt =
       smartFirstMax !== undefined ? { startSec: 0, maxDurationSec: 1 } : undefined;
-    const firstInfo = await this.inner.openAudio(firstSpec.sourceId, firstSpec.uri, firstProbeOpt);
+    const firstInfo = await this.inner.openAudio(firstTarget.sourceId, firstTarget.uri, firstProbeOpt);
     const firstTotalDur = Math.max(0.05, firstInfo.totalDurationSec ?? firstInfo.durationSec);
     const bps = bytesPerSampleFromSubtype(firstInfo.subtype);
     const pcmBytesPerSec = Math.max(1, firstInfo.sampleRate * firstInfo.numChannels * bps);
-    const firstSize = firstSpec.sizeBytes;
+    const firstSize = firstTarget.sizeBytes;
+    const effectiveNumChannels = hasVirtualChannels ? maxVirtualCh : firstInfo.numChannels;
 
     const segments: CombinedSegment[] = specs.map((spec, idx) => {
+      const refTarget = spec.channelFiles?.[0] ?? spec;
       let dur = firstTotalDur;
       if (idx === 0) {
         dur = firstTotalDur;
-      } else if (spec.sizeBytes && spec.sizeBytes > 64) {
-        if (isUncompressedFormat(firstInfo.format, spec.name)) {
-          dur = Math.max(0.1, (spec.sizeBytes - 44) / pcmBytesPerSec);
+      } else if (refTarget.sizeBytes && refTarget.sizeBytes > 64) {
+        if (isUncompressedFormat(firstInfo.format, refTarget.name)) {
+          dur = Math.max(0.1, (refTarget.sizeBytes - 44) / pcmBytesPerSec);
         } else if (firstSize && firstSize > 64) {
-          dur = Math.max(0.1, firstTotalDur * (spec.sizeBytes / firstSize));
+          dur = Math.max(0.1, firstTotalDur * (refTarget.sizeBytes / firstSize));
         }
       }
       return {
         index: idx,
-        sourceId: spec.sourceId,
-        uri: spec.uri,
-        name: spec.name,
-        folderName: spec.folderName,
-        sizeBytes: spec.sizeBytes,
+        sourceId: refTarget.sourceId,
+        uri: refTarget.uri,
+        name: refTarget.name,
+        folderName: spec.folderName ?? refTarget.folderName,
+        sizeBytes: refTarget.sizeBytes,
+        channelFiles: spec.channelFiles,
         durationSec: dur,
         probed: idx === 0,
         sampleRate: firstInfo.sampleRate,
-        numChannels: firstInfo.numChannels,
+        numChannels: effectiveNumChannels,
         format: firstInfo.format,
         subtype: firstInfo.subtype,
         startDateTimeIso:
           idx === 0
-            ? firstInfo.startDateTimeIso ?? inferIsoFromSpec(spec.name, spec.folderName)
-            : inferIsoFromSpec(spec.name, spec.folderName),
+            ? firstInfo.startDateTimeIso ?? inferIsoFromSpec(refTarget.name, spec.folderName)
+            : inferIsoFromSpec(refTarget.name, spec.folderName),
         timelineStartSec: 0,
         timelineEndSec: 0,
       };
@@ -508,16 +545,20 @@ export class CombinedEngineProxy implements AudioEngineClient {
 
     const combinedId = `combined::${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const resolvedStartIso =
-      firstInfo.startDateTimeIso ?? inferIsoFromSpec(firstSpec.name, firstSpec.folderName);
+      firstInfo.startDateTimeIso ?? inferIsoFromSpec(firstTarget.name, firstSpec.folderName);
 
     const rec: CombinedRecording = {
       combinedId,
       recordingKey,
       title,
-      sourceId: firstSpec.sourceId,
-      uri: `${specs[0].uri}..${specs[specs.length - 1].name} (${specs.length} segments)`,
+      sourceId: firstTarget.sourceId,
+      uri:
+        specs.length > 1
+          ? `${firstTarget.uri}..${specs[specs.length - 1].name} (${specs.length} segments)`
+          : `${firstTarget.uri} (${effectiveNumChannels} ch)`,
       sampleRate: firstInfo.sampleRate,
-      numChannels: firstInfo.numChannels,
+      numChannels: effectiveNumChannels,
+      hasVirtualChannels,
       format: firstInfo.format,
       subtype: firstInfo.subtype,
       startDateTimeIso: resolvedStartIso,
@@ -530,9 +571,9 @@ export class CombinedEngineProxy implements AudioEngineClient {
     };
     recomputeTimelines(rec);
 
-    // Seed segment 0 open slice
+    // Seed segment 0 / channel 0 open slice
     const sliceStart0 = firstInfo.windowStartSec ?? 0;
-    rec.openSlices.set(0, {
+    rec.openSlices.set('0:0', {
       fileInfo: firstInfo,
       sliceStartSec: sliceStart0,
       sliceEndSec: sliceStart0 + firstInfo.durationSec,
@@ -569,31 +610,36 @@ export class CombinedEngineProxy implements AudioEngineClient {
     segIndex: number,
     segLocalStart: number,
     segLocalEnd: number,
-  ): Promise<OpenedSliceCache> {
+    virtualChannel = 0,
+  ): Promise<{ slice: OpenedSliceCache; innerChannel: number }> {
     const seg = rec.segments[segIndex];
     if (!seg) throw new Error(`Missing combined segment #${segIndex}`);
 
-    const existing = rec.openSlices.get(segIndex);
+    const target = this.resolveSegmentTarget(rec, seg, virtualChannel);
+    const existing = rec.openSlices.get(target.cacheKey);
     if (
       existing &&
       existing.sliceStartSec <= segLocalStart + 0.005 &&
       existing.sliceEndSec >= segLocalEnd - 0.005
     ) {
       existing.lastUsedAt = Date.now();
-      return existing;
+      return { slice: existing, innerChannel: target.innerChannel };
     }
 
-    const safeMax = getSafeMaxWindowSec(seg.sampleRate, seg.numChannels);
+    const perFileCh = rec.hasVirtualChannels ? 1 : seg.numChannels;
+    const safeMax = getSafeMaxWindowSec(seg.sampleRate, perFileCh);
     const reqSpan = Math.max(5, segLocalEnd - segLocalStart);
-    const openFull = seg.durationSec <= safeMax && (seg.sizeBytes === undefined || seg.sizeBytes <= 25 * 1024 * 1024);
+    const openFull =
+      seg.durationSec <= safeMax &&
+      (target.sizeBytes === undefined || target.sizeBytes <= 25 * 1024 * 1024);
 
     let opened: AudioFileInfo;
     if (openFull) {
-      opened = await this.inner.openAudio(seg.sourceId, seg.uri);
+      opened = await this.inner.openAudio(target.sourceId, target.uri);
     } else {
       const targetLen = Math.min(seg.durationSec, safeMax, Math.max(reqSpan + 30, 300));
       const padStart = Math.max(0, Math.min(Math.max(0, seg.durationSec - targetLen), segLocalStart - 5));
-      opened = await this.inner.openAudio(seg.sourceId, seg.uri, {
+      opened = await this.inner.openAudio(target.sourceId, target.uri, {
         startSec: padStart,
         maxDurationSec: Math.ceil(targetLen),
       });
@@ -604,7 +650,9 @@ export class CombinedEngineProxy implements AudioEngineClient {
       seg.probed = true;
       seg.durationSec = exactDur;
       seg.sampleRate = opened.sampleRate;
-      seg.numChannels = opened.numChannels;
+      if (!rec.hasVirtualChannels) {
+        seg.numChannels = opened.numChannels;
+      }
       if (opened.startDateTimeIso) {
         seg.startDateTimeIso = opened.startDateTimeIso;
         if (segIndex === 0) rec.startDateTimeIso = opened.startDateTimeIso;
@@ -620,13 +668,13 @@ export class CombinedEngineProxy implements AudioEngineClient {
       sliceEndSec: sliceStart + opened.durationSec,
       lastUsedAt: Date.now(),
     };
-    rec.openSlices.set(segIndex, entry);
+    rec.openSlices.set(target.cacheKey, entry);
 
     if (rec.openSlices.size > MAX_OPEN_SLICES_PER_COMBINED) {
-      let oldestKey: number | null = null;
+      let oldestKey: string | null = null;
       let oldestTime = Infinity;
       for (const [k, v] of rec.openSlices.entries()) {
-        if (k !== segIndex && v.lastUsedAt < oldestTime) {
+        if (k !== target.cacheKey && v.lastUsedAt < oldestTime) {
           oldestTime = v.lastUsedAt;
           oldestKey = k;
         }
@@ -634,7 +682,7 @@ export class CombinedEngineProxy implements AudioEngineClient {
       if (oldestKey !== null) rec.openSlices.delete(oldestKey);
     }
 
-    return entry;
+    return { slice: entry, innerChannel: target.innerChannel };
   }
 
   private resolveOverlappingSegments(
@@ -744,21 +792,36 @@ export class CombinedEngineProxy implements AudioEngineClient {
       throw new Error('Requested spectrogram range falls outside combined recording bounds.');
     }
 
+    const mapSegmentsForChannel = (virtualCh: number) =>
+      rec.hasVirtualChannels
+        ? rec.segments.map((seg) => {
+            const target = this.resolveSegmentTarget(rec, seg, virtualCh);
+            return {
+              ...seg,
+              sourceId: target.sourceId,
+              uri: target.uri,
+              name: target.name,
+              sizeBytes: target.sizeBytes,
+            };
+          })
+        : rec.segments;
+
     if (
       shouldUseSparseSpectrogram(
         spanSec,
         rec.sampleRate,
-        rec.numChannels,
+        rec.hasVirtualChannels ? 1 : rec.numChannels,
         params.fftSize,
         overlaps.length,
       )
     ) {
       const winOff = rec.windowStartSec;
+      const sparseParams = rec.hasVirtualChannels ? { ...params, channel: 0 } : params;
       const mat = await fetchSparseSpectrogram(
         this.inner,
         fileId,
-        rec.segments,
-        params,
+        mapSegmentsForChannel(params.channel),
+        sparseParams,
         rec.sampleRate,
         {
           startSec: winOff + relStart,
@@ -773,6 +836,7 @@ export class CombinedEngineProxy implements AudioEngineClient {
             ? (partial) =>
                 sparseOpts.onProgress?.({
                   ...partial,
+                  channel: params.channel,
                   startSec: Math.max(0, partial.startSec - winOff),
                   endSec: Math.max(0.01, partial.endSec - winOff),
                 })
@@ -784,7 +848,9 @@ export class CombinedEngineProxy implements AudioEngineClient {
               seg.probed = true;
               seg.durationSec = exactDur;
               seg.sampleRate = opened.sampleRate;
-              seg.numChannels = opened.numChannels;
+              if (!rec.hasVirtualChannels) {
+                seg.numChannels = opened.numChannels;
+              }
               if (opened.startDateTimeIso) {
                 seg.startDateTimeIso = opened.startDateTimeIso;
                 if (segIdx === 0) rec.startDateTimeIso = opened.startDateTimeIso;
@@ -797,6 +863,7 @@ export class CombinedEngineProxy implements AudioEngineClient {
       );
       return {
         ...mat,
+        channel: params.channel,
         startSec: relStart,
         endSec: relEnd,
       };
@@ -804,7 +871,13 @@ export class CombinedEngineProxy implements AudioEngineClient {
 
     const matrices: SpectrogramMatrix[] = [];
     for (const ov of overlaps) {
-      const slice = await this.ensureSegmentSlice(rec, ov.seg.index, ov.segLocalStart, ov.segLocalEnd);
+      const { slice, innerChannel } = await this.ensureSegmentSlice(
+        rec,
+        ov.seg.index,
+        ov.segLocalStart,
+        ov.segLocalEnd,
+        params.channel,
+      );
       const hStart = Math.max(0, ov.segLocalStart - slice.sliceStartSec);
       const hEnd = Math.min(slice.fileInfo.durationSec, ov.segLocalEnd - slice.sliceStartSec);
       if (hEnd <= hStart + 1e-4) continue;
@@ -820,11 +893,11 @@ export class CombinedEngineProxy implements AudioEngineClient {
       const partMat = await fetchSpectrogramAdaptive(
         this.inner,
         sliceInfo,
-        params,
+        { ...params, channel: innerChannel },
         { startSec: hStart, endSec: hEnd, minFreqHz, maxFreqHz },
         targetBins,
       );
-      matrices.push(partMat);
+      matrices.push({ ...partMat, channel: params.channel });
     }
 
     if (matrices.length === 0) {
@@ -909,14 +982,32 @@ export class CombinedEngineProxy implements AudioEngineClient {
 
     if (
       overlaps.length > 4 ||
-      shouldUseSparseSpectrogram(span, rec.sampleRate, rec.numChannels, 512, overlaps.length)
+      shouldUseSparseSpectrogram(
+        span,
+        rec.sampleRate,
+        rec.hasVirtualChannels ? 1 : rec.numChannels,
+        512,
+        overlaps.length,
+      )
     ) {
       const winOff = rec.windowStartSec;
+      const mappedSegments = rec.hasVirtualChannels
+        ? rec.segments.map((seg) => {
+            const target = this.resolveSegmentTarget(rec, seg, channel);
+            return {
+              ...seg,
+              sourceId: target.sourceId,
+              uri: target.uri,
+              name: target.name,
+              sizeBytes: target.sizeBytes,
+            };
+          })
+        : rec.segments;
       const wf = await fetchSparseWaveform(
         this.inner,
         fileId,
-        rec.segments,
-        channel,
+        mappedSegments,
+        rec.hasVirtualChannels ? 0 : channel,
         numBins,
         winOff + relStart,
         winOff + relEnd,
@@ -924,6 +1015,7 @@ export class CombinedEngineProxy implements AudioEngineClient {
       );
       return {
         ...wf,
+        channel,
         startSec: relStart,
         endSec: relEnd,
       };
@@ -933,12 +1025,24 @@ export class CombinedEngineProxy implements AudioEngineClient {
     const maxValues: number[] = [];
 
     for (const ov of overlaps) {
-      const slice = await this.ensureSegmentSlice(rec, ov.seg.index, ov.segLocalStart, ov.segLocalEnd);
+      const { slice, innerChannel } = await this.ensureSegmentSlice(
+        rec,
+        ov.seg.index,
+        ov.segLocalStart,
+        ov.segLocalEnd,
+        channel,
+      );
       const hStart = Math.max(0, ov.segLocalStart - slice.sliceStartSec);
       const hEnd = Math.min(slice.fileInfo.durationSec, ov.segLocalEnd - slice.sliceStartSec);
       if (hEnd <= hStart + 1e-4) continue;
       const partBins = Math.max(8, Math.round(((hEnd - hStart) / Math.max(1e-6, span)) * numBins));
-      const wf = await this.inner.getWaveform(slice.fileInfo.fileId, channel, partBins, hStart, hEnd);
+      const wf = await this.inner.getWaveform(
+        slice.fileInfo.fileId,
+        innerChannel,
+        partBins,
+        hStart,
+        hEnd,
+      );
       minValues.push(...wf.minValues);
       maxValues.push(...wf.maxValues);
     }
@@ -1063,12 +1167,19 @@ export class CombinedEngineProxy implements AudioEngineClient {
 
     const parts: Array<{ m: SelectionMeasurements; winBaseSec: number }> = [];
     for (const ov of overlaps) {
-      const slice = await this.ensureSegmentSlice(rec, ov.seg.index, ov.segLocalStart, ov.segLocalEnd);
+      const { slice, innerChannel } = await this.ensureSegmentSlice(
+        rec,
+        ov.seg.index,
+        ov.segLocalStart,
+        ov.segLocalEnd,
+        req.channel,
+      );
       const hStart = Math.max(0, ov.segLocalStart - slice.sliceStartSec);
       const hEnd = Math.min(slice.fileInfo.durationSec, ov.segLocalEnd - slice.sliceStartSec);
       if (hEnd <= hStart + 1e-4) continue;
       const m = await this.inner.measureSelection(slice.fileInfo.fileId, {
         ...req,
+        channel: innerChannel,
         startSec: hStart,
         endSec: hEnd,
       });
@@ -1149,13 +1260,20 @@ export class CombinedEngineProxy implements AudioEngineClient {
     let totalWeight = 0;
 
     for (const ov of overlaps) {
-      const slice = await this.ensureSegmentSlice(rec, ov.seg.index, ov.segLocalStart, ov.segLocalEnd);
+      const { slice, innerChannel } = await this.ensureSegmentSlice(
+        rec,
+        ov.seg.index,
+        ov.segLocalStart,
+        ov.segLocalEnd,
+        req.channel ?? 0,
+      );
       const hStart = Math.max(0, ov.segLocalStart - slice.sliceStartSec);
       const hEnd = Math.min(slice.fileInfo.durationSec, ov.segLocalEnd - slice.sliceStartSec);
       if (hEnd <= hStart + 0.02) continue;
 
       const resp = await this.inner.detectSounds(slice.fileInfo.fileId, {
         ...req,
+        channel: innerChannel,
         startSec: hStart,
         endSec: hEnd,
       });
@@ -1295,24 +1413,27 @@ export class CombinedEngineProxy implements AudioEngineClient {
     const numCh = Math.max(1, rec.numChannels);
     const decodedChunks: Float32Array[][] = [];
 
-    for (const ov of overlaps) {
-      // Request a tight slice if segment is huge so playback stays fast!
-      const segSpan = ov.segLocalEnd - ov.segLocalStart;
+    const decodeTargetSlice = async (
+      target: { sourceId: string; uri: string; cacheKey: string },
+      segLocalStart: number,
+      segLocalEnd: number,
+    ): Promise<{ channels: Float32Array[]; sampleRate: number }> => {
+      const segSpan = segLocalEnd - segLocalStart;
       let targetFileId: string;
       let sliceOffset = 0;
 
-      const existing = rec.openSlices.get(ov.seg.index);
+      const existing = rec.openSlices.get(target.cacheKey);
       if (
         existing &&
-        existing.sliceStartSec <= ov.segLocalStart + 0.005 &&
-        existing.sliceEndSec >= ov.segLocalEnd - 0.005 &&
+        existing.sliceStartSec <= segLocalStart + 0.005 &&
+        existing.sliceEndSec >= segLocalEnd - 0.005 &&
         existing.fileInfo.durationSec <= Math.max(600, segSpan + 120)
       ) {
         targetFileId = existing.fileInfo.fileId;
         sliceOffset = existing.sliceStartSec;
       } else {
-        const openedPlay = await this.inner.openAudio(ov.seg.sourceId, ov.seg.uri, {
-          startSec: ov.segLocalStart,
+        const openedPlay = await this.inner.openAudio(target.sourceId, target.uri, {
+          startSec: segLocalStart,
           maxDurationSec: Math.max(5, Math.ceil(segSpan + 1)),
         });
         targetFileId = openedPlay.fileId;
@@ -1341,18 +1462,45 @@ export class CombinedEngineProxy implements AudioEngineClient {
         }
       }
 
-      const hStart = Math.max(0, ov.segLocalStart - sliceOffset);
-      const hEnd = Math.max(hStart + 0.01, ov.segLocalEnd - sliceOffset);
+      const hStart = Math.max(0, segLocalStart - sliceOffset);
+      const hEnd = Math.max(hStart + 0.01, segLocalEnd - sliceOffset);
       const i0 = Math.max(0, Math.floor(hStart * segRate));
       const i1 = Math.min(segChannels[0]?.length ?? 0, Math.ceil(hEnd * segRate));
+      return {
+        sampleRate: segRate,
+        channels: segChannels.map((src) => {
+          const sub = src.subarray(i0, Math.max(i0, i1));
+          return segRate === sampleRate ? sub.slice() : resampleLinear(sub, segRate, sampleRate);
+        }),
+      };
+    };
 
-      const sliced: Float32Array[] = [];
-      for (let c = 0; c < numCh; c++) {
-        const src = segChannels[Math.min(c, segChannels.length - 1)] ?? new Float32Array(0);
-        const sub = src.subarray(i0, Math.max(i0, i1));
-        sliced.push(segRate === sampleRate ? sub.slice() : resampleLinear(sub, segRate, sampleRate));
+    for (const ov of overlaps) {
+      if (rec.hasVirtualChannels && ov.seg.channelFiles && ov.seg.channelFiles.length > 1) {
+        const chTracks = await Promise.all(
+          Array.from({ length: numCh }, (_, c) => {
+            const target = this.resolveSegmentTarget(rec, ov.seg, c);
+            return decodeTargetSlice(target, ov.segLocalStart, ov.segLocalEnd);
+          }),
+        );
+        const maxLen = chTracks.reduce((m, t) => Math.max(m, t.channels[0]?.length ?? 0), 0);
+        const sliced: Float32Array[] = chTracks.map((t) => {
+          const ch0 = t.channels[0] ?? new Float32Array(0);
+          if (ch0.length === maxLen) return ch0;
+          const padded = new Float32Array(maxLen);
+          padded.set(ch0);
+          return padded;
+        });
+        decodedChunks.push(sliced);
+      } else {
+        const target = this.resolveSegmentTarget(rec, ov.seg, 0);
+        const dec = await decodeTargetSlice(target, ov.segLocalStart, ov.segLocalEnd);
+        const sliced: Float32Array[] = [];
+        for (let c = 0; c < numCh; c++) {
+          sliced.push(dec.channels[Math.min(c, dec.channels.length - 1)] ?? new Float32Array(0));
+        }
+        decodedChunks.push(sliced);
       }
-      decodedChunks.push(sliced);
     }
 
     const totalFrames = decodedChunks.reduce((acc, chs) => acc + (chs[0]?.length ?? 0), 0);
@@ -1413,9 +1561,9 @@ export class CombinedEngineProxy implements AudioEngineClient {
     }
 
     const overlaps = this.resolveOverlappingSegments(rec, req.startSec, req.endSec);
-    if (overlaps.length === 1) {
+    if (overlaps.length === 1 && !rec.hasVirtualChannels) {
       const ov = overlaps[0];
-      const slice = await this.ensureSegmentSlice(rec, ov.seg.index, ov.segLocalStart, ov.segLocalEnd);
+      const { slice } = await this.ensureSegmentSlice(rec, ov.seg.index, ov.segLocalStart, ov.segLocalEnd, 0);
       const hStart = Math.max(0, ov.segLocalStart - slice.sliceStartSec);
       const hEnd = Math.min(slice.fileInfo.durationSec, ov.segLocalEnd - slice.sliceStartSec);
       return this.inner.clipAndSave({

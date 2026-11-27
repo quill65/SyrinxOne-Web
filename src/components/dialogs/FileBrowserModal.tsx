@@ -14,6 +14,7 @@ import {
   RotateCcw,
   Search,
   SlidersHorizontal,
+  Sparkles,
   Upload,
   X,
 } from 'lucide-react';
@@ -61,6 +62,20 @@ import {
   isDocumentationEntryName,
   type ArchiveTargetInput,
 } from '../../utils/archiveDocs';
+import {
+  analyzeRecordingStructure,
+  buildDefinedRecordings,
+  clearSavedRecordingDefinition,
+  getSavedRecordingDefinition,
+  makeStructureSourceKey,
+  saveRecordingDefinition,
+  scanDriveFilesForStructure,
+  scanSourceFilesForStructure,
+  type DefinedRecording,
+  type RecordingStructureDefinition,
+  type ScannedAudioFile,
+} from '../../utils/recordingStructure';
+import { DefineRecordingsPanel } from './DefineRecordingsPanel';
 
 interface PendingCombinePrompt {
   origin: 'source' | 'drive';
@@ -128,6 +143,27 @@ export const FileBrowserModal: React.FC = () => {
   const [driveLoading, setDriveLoading] = useState(false);
   const [driveError, setDriveError] = useState<string | null>(null);
   const [driveBusyAuth, setDriveBusyAuth] = useState(false);
+
+  // User-defined recording structure state (persisted per source)
+  const [savedDefinition, setSavedDefinition] = useState<RecordingStructureDefinition | null>(null);
+  const [viewMode, setViewMode] = useState<'recordings' | 'files'>('files');
+  const [showDefinePanel, setShowDefinePanel] = useState(false);
+  const [structureIncludeSubfolders, setStructureIncludeSubfolders] = useState(true);
+  const [structureFiles, setStructureFiles] = useState<ScannedAudioFile[]>([]);
+  const [structureDocText, setStructureDocText] = useState('');
+  const [structureScanState, setStructureScanState] = useState<{
+    scanning: boolean;
+    filesFound: number;
+    foldersScanned: number;
+    truncated: boolean;
+    error: string | null;
+  }>({
+    scanning: false,
+    filesFound: 0,
+    foldersScanned: 0,
+    truncated: false,
+    error: null,
+  });
 
   const isDriveSource = activeSourceId === 'gdrive_oauth';
   const isHttpSource = activeSourceId === 'http';
@@ -254,16 +290,213 @@ export const FileBrowserModal: React.FC = () => {
     const staticSpec = buildStaticArchiveAbout(currentAboutTarget);
     setBrowserAboutBrief(staticSpec.briefDescription);
     setBrowserDocCount(staticSpec.readmeFiles.length + staticSpec.documentationLinks.length);
+    setStructureDocText(
+      [staticSpec.briefDescription, ...staticSpec.deepDescription].filter(Boolean).join('\n'),
+    );
 
     void discoverArchiveDocumentation(engine, currentAboutTarget, { readText: true }).then((spec) => {
       if (cancelled) return;
       setBrowserAboutBrief(spec.briefDescription);
       setBrowserDocCount(spec.readmeFiles.length + spec.documentationLinks.length);
+      setStructureDocText(
+        [
+          spec.briefDescription,
+          ...spec.deepDescription,
+          spec.primaryReadmeText ?? '',
+        ]
+          .filter(Boolean)
+          .join('\n\n'),
+      );
     });
     return () => {
       cancelled = true;
     };
   }, [show, engine, currentAboutTarget]);
+
+  const structureSourceKey = useMemo(
+    () => makeStructureSourceKey(activeSourceId, isDriveSource ? currentDriveFolder.id : undefined),
+    [activeSourceId, isDriveSource, currentDriveFolder.id],
+  );
+
+  // Restore saved recording structure definition whenever source (or Drive folder) changes
+  useEffect(() => {
+    if (!show || isHttpSource) {
+      setSavedDefinition(null);
+      setViewMode('files');
+      setShowDefinePanel(false);
+      return;
+    }
+    const existing = getSavedRecordingDefinition(structureSourceKey);
+    setSavedDefinition(existing);
+    setShowDefinePanel(false);
+    setStructureFiles([]);
+    if (existing && existing.combineMode !== 'individual') {
+      setStructureIncludeSubfolders(existing.includeSubfolders ?? true);
+      setViewMode('recordings');
+    } else {
+      setViewMode('files');
+    }
+  }, [show, structureSourceKey, isHttpSource]);
+
+  const runStructureScan = async (
+    targetPrefix: string,
+    includeSubs: boolean,
+    seedSourceEntries?: BrowseEntry[],
+    seedDriveList?: DriveItem[],
+  ) => {
+    if (isHttpSource) return;
+    setStructureScanState({
+      scanning: true,
+      filesFound: 0,
+      foldersScanned: 0,
+      truncated: false,
+      error: null,
+    });
+    try {
+      if (isDriveSource) {
+        if (!hasDriveToken) {
+          setStructureScanState((prev) => ({ ...prev, scanning: false }));
+          return;
+        }
+        const driveFolderId = currentDriveFolder.id;
+        const existingDriveSrc =
+          sources.find((s) => s.kind === 'gdrive' && s.rootPath === driveFolderId)?.sourceId ??
+          `gdrive_pending::${driveFolderId}`;
+        const res = await scanDriveFilesForStructure(existingDriveSrc, driveFolderId, {
+          includeSubfolders: includeSubs,
+          seedItems: seedDriveList && seedDriveList.length > 0 ? seedDriveList : undefined,
+          onProgress: (prog) => {
+            setStructureScanState((prev) => ({
+              ...prev,
+              filesFound: prog.filesFound,
+              foldersScanned: prog.foldersScanned,
+            }));
+          },
+        });
+        setStructureFiles(res.files);
+        setStructureScanState({
+          scanning: false,
+          filesFound: res.files.length,
+          foldersScanned: res.scannedFolders,
+          truncated: res.truncated,
+          error: null,
+        });
+      } else {
+        const res = await scanSourceFilesForStructure(engine, activeSourceId, targetPrefix, {
+          includeSubfolders: includeSubs,
+          seedEntries: seedSourceEntries && seedSourceEntries.length > 0 ? seedSourceEntries : undefined,
+          onProgress: (prog) => {
+            setStructureScanState((prev) => ({
+              ...prev,
+              filesFound: prog.filesFound,
+              foldersScanned: prog.foldersScanned,
+            }));
+          },
+        });
+        setStructureFiles(res.files);
+        setStructureScanState({
+          scanning: false,
+          filesFound: res.files.length,
+          foldersScanned: res.scannedFolders,
+          truncated: res.truncated,
+          error: null,
+        });
+      }
+    } catch (err) {
+      setStructureScanState((prev) => ({
+        ...prev,
+        scanning: false,
+        error: err instanceof Error ? err.message : 'Failed to scan archive structure',
+      }));
+    }
+  };
+
+  // Automatically scan files whenever Defined Recordings View is active or Define panel opens
+  useEffect(() => {
+    if (!show || isHttpSource) return;
+    if (isDriveSource && !hasDriveToken) return;
+    const needsScan =
+      showDefinePanel ||
+      (viewMode === 'recordings' && savedDefinition !== null && savedDefinition.combineMode !== 'individual');
+    if (!needsScan) return;
+
+    const targetPfx =
+      !showDefinePanel && savedDefinition?.rootPrefix !== undefined
+        ? savedDefinition.rootPrefix
+        : prefix || activeSourceInfo?.rootPath || '';
+    const seedSrc = !isDriveSource && targetPfx === prefix && entries.length > 0 ? entries : undefined;
+    const seedDrv = isDriveSource && driveItems.length > 0 ? driveItems : undefined;
+    void runStructureScan(targetPfx, structureIncludeSubfolders, seedSrc, seedDrv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    show,
+    showDefinePanel,
+    viewMode,
+    savedDefinition?.updatedAt,
+    structureIncludeSubfolders,
+    activeSourceId,
+    isDriveSource,
+    hasDriveToken,
+    currentDriveFolder.id,
+  ]);
+
+  const definedRecordings = useMemo<DefinedRecording[]>(() => {
+    if (!savedDefinition || savedDefinition.combineMode === 'individual') return [];
+    return buildDefinedRecordings(structureFiles, savedDefinition);
+  }, [structureFiles, savedDefinition]);
+
+  const visibleDefinedRecordings = useMemo(() => {
+    const q = filterText.trim().toLowerCase();
+    if (!q) return definedRecordings;
+    return definedRecordings.filter(
+      (r) =>
+        r.title.toLowerCase().includes(q) ||
+        r.subtitle.toLowerCase().includes(q) ||
+        r.specs.some((s) => s.name.toLowerCase().includes(q)),
+    );
+  }, [definedRecordings, filterText]);
+
+  // Fast heuristic hint on currently listed items when no recording definition is saved yet
+  const quickStructureHint = useMemo(() => {
+    if (savedDefinition || isHttpSource) return null;
+    const currentAudio: ScannedAudioFile[] = isDriveSource
+      ? driveItems
+          .filter((d) => !d.isFolder && d.kind === 'audio')
+          .map((d) => ({
+            sourceId: 'gdrive_oauth',
+            uri: d.id,
+            name: d.name,
+            dirParts: [],
+            sizeBytes: d.sizeBytes,
+          }))
+      : entries
+          .filter((e) => !e.isDir && e.kind === 'audio')
+          .map((e) => ({
+            sourceId: activeSourceId,
+            uri: e.uri,
+            name: e.name,
+            dirParts: [],
+            sizeBytes: e.sizeBytes,
+          }));
+    const folderCount = isDriveSource
+      ? driveItems.filter((d) => d.isFolder).length
+      : entries.filter((e) => e.isDir && e.name !== '..').length;
+
+    if (currentAudio.length >= 2) {
+      const quick = analyzeRecordingStructure(currentAudio);
+      if (quick.detectedChannelFieldId) {
+        const chField = quick.fields.find((f) => f.id === quick.detectedChannelFieldId);
+        return `Detected ${chField?.uniqueCount ?? 'multi'}-channel paired files (${chField?.sampleValues[0] ?? 'CH1'}–${chField?.sampleValues[chField.sampleValues.length - 1] ?? 'CHn'}). Define recordings to combine channels automatically.`;
+      }
+      if (quick.hasDates && currentAudio.length >= 3) {
+        return `Detected ${currentAudio.length} dated audio files. Define recordings to group by hour, day, month, or year.`;
+      }
+    }
+    if (folderCount >= 2 && currentAudio.length === 0) {
+      return `Multiple folders detected (${folderCount}). Use Define Recordings to scan subfolders and group files by year, month, day, or site.`;
+    }
+    return null;
+  }, [savedDefinition, isHttpSource, isDriveSource, driveItems, entries, activeSourceId]);
 
   const visibleEntries = useMemo(() => {
     const q = filterText.trim().toLowerCase();
@@ -829,6 +1062,76 @@ export const FileBrowserModal: React.FC = () => {
     setModalState('showFileBrowser', false);
   };
 
+  const handleSaveRecordingDefinition = (def: RecordingStructureDefinition) => {
+    saveRecordingDefinition(structureSourceKey, def);
+    setSavedDefinition(def);
+    setShowDefinePanel(false);
+    setViewMode(def.combineMode === 'individual' ? 'files' : 'recordings');
+    setStatus(`Saved recording definition: ${def.label}`);
+  };
+
+  const handleResetRecordingDefinition = () => {
+    clearSavedRecordingDefinition(structureSourceKey);
+    setSavedDefinition(null);
+    setShowDefinePanel(false);
+    setViewMode('files');
+    setStatus('Reset to individual files view');
+  };
+
+  const handleOpenDefinedRecording = async (rec: DefinedRecording) => {
+    if (combiningBusy) return;
+    setCombiningBusy(true);
+    setBrowseError(null);
+    setDriveError(null);
+    try {
+      let specs = rec.specs;
+      // For Google Drive defined recordings, ensure the Drive folder is connected on the backend engine
+      if (isDriveSource) {
+        const connectedId = await connectOrReuseDriveFolder(
+          currentDriveFolder.id,
+          currentDriveFolder.name,
+        );
+        specs = rec.specs.map((s) => ({
+          ...s,
+          sourceId: connectedId,
+          ...(s.channelFiles
+            ? {
+                channelFiles: s.channelFiles.map((cf) => ({ ...cf, sourceId: connectedId })),
+              }
+            : {}),
+        }));
+      }
+
+      const firstSpec = specs[0];
+      if (!firstSpec) return;
+
+      if (specs.length === 1 && rec.channelCount <= 1) {
+        const recKey = makeSingleRecordingKey(firstSpec.sourceId, firstSpec.uri);
+        await openAudioFromSource(
+          firstSpec.sourceId,
+          firstSpec.uri,
+          resolveOpenOptions(firstSpec.name, firstSpec.sizeBytes, recKey),
+        );
+      } else {
+        const recKey = makeCombinedRecordingKey(firstSpec.sourceId, specs);
+        const openOpts = resolveOpenOptions(firstSpec.name, firstSpec.sizeBytes, recKey);
+        await openCombinedArchive(specs, rec.title, {
+          ...openOpts,
+          recordingKey: recKey,
+          restoreSaved: !hasManualWindowOverride,
+        });
+      }
+      setPrefsVersion((v) => v + 1);
+      setModalState('showFileBrowser', false);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to open defined recording';
+      if (isDriveSource) setDriveError(msg);
+      else setBrowseError(msg);
+    } finally {
+      setCombiningBusy(false);
+    }
+  };
+
   const activeSelectionCount = isDriveSource ? selectedDriveIds.length : selectedUris.length;
   const activeGroups = isDriveSource ? allDriveGroups : allSourceGroups;
 
@@ -883,6 +1186,18 @@ export const FileBrowserModal: React.FC = () => {
                   />
                 </label>
               )}
+              {!isHttpSource && (!isDriveSource || hasDriveToken) && (
+                <button
+                  className={`btn-small ${showDefinePanel || (savedDefinition && savedDefinition.combineMode !== 'individual') ? 'btn-active' : ''}`}
+                  onClick={() => setShowDefinePanel((v) => !v)}
+                  title="Analyze filenames, folders & docs to define how files combine into recordings"
+                >
+                  <Sparkles size={12} />{' '}
+                  {savedDefinition && savedDefinition.combineMode !== 'individual'
+                    ? 'Edit Structure'
+                    : 'Define Recordings'}
+                </button>
+              )}
               <button
                 className={`btn-small ${showSliceOptions ? 'btn-active' : ''}`}
                 onClick={() => setShowSliceOptions((v) => !v)}
@@ -893,11 +1208,20 @@ export const FileBrowserModal: React.FC = () => {
               {!isHttpSource && (
                 <button
                   className="btn-small"
-                  onClick={() =>
-                    isDriveSource
-                      ? void loadDriveFolder(currentDriveFolder.id, filterText)
-                      : void refresh(activeSourceId, prefix)
-                  }
+                  onClick={() => {
+                    if (showDefinePanel || viewMode === 'recordings') {
+                      const targetPfx =
+                        !showDefinePanel && savedDefinition?.rootPrefix !== undefined
+                          ? savedDefinition.rootPrefix
+                          : prefix || activeSourceInfo?.rootPath || '';
+                      void runStructureScan(targetPfx, structureIncludeSubfolders);
+                    }
+                    if (isDriveSource) {
+                      void loadDriveFolder(currentDriveFolder.id, filterText);
+                    } else {
+                      void refresh(activeSourceId, prefix);
+                    }
+                  }}
                   title="Refresh folder contents"
                 >
                   <RefreshCw size={12} />
@@ -1077,11 +1401,91 @@ export const FileBrowserModal: React.FC = () => {
               </div>
               {driveError && <div className="inline-error">{driveError}</div>}
             </div>
+          ) : showDefinePanel ? (
+            <DefineRecordingsPanel
+              sourceLabel={isDriveSource ? currentDriveFolder.name : activeSourceDisplayName}
+              scannedFiles={structureFiles}
+              scanState={structureScanState}
+              includeSubfolders={structureIncludeSubfolders}
+              onToggleSubfolders={setStructureIncludeSubfolders}
+              docText={structureDocText}
+              initialDefinition={savedDefinition}
+              rootPrefix={isDriveSource ? currentDriveFolder.id : prefix || activeSourceInfo?.rootPath || ''}
+              onSave={handleSaveRecordingDefinition}
+              onReset={handleResetRecordingDefinition}
+              onCancel={() => setShowDefinePanel(false)}
+            />
           ) : (
             <>
+              {/* Active Saved Recording Structure Banner */}
+              {savedDefinition && savedDefinition.combineMode !== 'individual' && (
+                <div className="structure-active-bar">
+                  <div className="structure-active-info">
+                    <Layers size={14} color="#38bdf8" />
+                    <div>
+                      <strong>{savedDefinition.label}</strong>
+                      <div className="structure-active-sub">
+                        {structureScanState.scanning
+                          ? `Scanning archive (${structureScanState.filesFound} files)...`
+                          : `${definedRecordings.length} recording${definedRecordings.length === 1 ? '' : 's'} from ${structureFiles.length} file${structureFiles.length === 1 ? '' : 's'}`}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="structure-active-actions">
+                    <button
+                      type="button"
+                      className={`btn-small ${viewMode === 'recordings' ? 'btn-active' : ''}`}
+                      onClick={() => setViewMode('recordings')}
+                    >
+                      Recordings ({definedRecordings.length})
+                    </button>
+                    <button
+                      type="button"
+                      className={`btn-small ${viewMode === 'files' ? 'btn-active' : ''}`}
+                      onClick={() => setViewMode('files')}
+                    >
+                      Raw Files
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-small"
+                      onClick={() => setShowDefinePanel(true)}
+                      title="Change how files are combined into recordings"
+                    >
+                      <Sparkles size={11} /> Change
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-small"
+                      onClick={handleResetRecordingDefinition}
+                      title="Forget saved structure and return to raw files"
+                    >
+                      <RotateCcw size={11} />
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Smart Discovery Hint when Multi-File Structure Is Detected */}
+              {!savedDefinition && quickStructureHint && (
+                <div className="structure-suggest-banner">
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    <Sparkles size={13} color="#38bdf8" />
+                    <span>{quickStructureHint}</span>
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-small btn-primary"
+                    onClick={() => setShowDefinePanel(true)}
+                  >
+                    <Sparkles size={11} /> Define Recordings
+                  </button>
+                </div>
+              )}
+
               {/* Navigation & Filter Row */}
               <div className="browser-subbar">
-                {isDriveSource ? (
+                {viewMode === 'recordings' && savedDefinition && savedDefinition.combineMode !== 'individual' ? null : isDriveSource ? (
                   <div className="gdrive-root-switch">
                     <button
                       className={`btn-small ${driveScopeRoot === 'root' ? 'btn-active' : ''}`}
@@ -1146,7 +1550,7 @@ export const FileBrowserModal: React.FC = () => {
                 </div>
               </div>
 
-              {activeGroups.length > 0 && (
+              {viewMode === 'files' && activeGroups.length > 0 && (
                 <div className="contiguous-banner">
                   <div className="contiguous-banner-info">
                     <Layers size={14} color="#38bdf8" />
@@ -1226,7 +1630,7 @@ export const FileBrowserModal: React.FC = () => {
                 </div>
               )}
 
-              {activeSelectionCount > 0 && (
+              {viewMode === 'files' && activeSelectionCount > 0 && (
                 <div className="selection-combine-bar">
                   <span>{activeSelectionCount} selected</span>
                   <div style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
@@ -1282,6 +1686,59 @@ export const FileBrowserModal: React.FC = () => {
               )}
 
               <div className="browser-list">
+                {viewMode === 'recordings' && savedDefinition && savedDefinition.combineMode !== 'individual' ? (
+                  <>
+                    {structureScanState.scanning && (
+                      <div className="panel-empty">
+                        Building recordings ({structureScanState.filesFound} audio files scanned)...
+                      </div>
+                    )}
+                    {!structureScanState.scanning && structureScanState.error && (
+                      <div className="inline-error">{structureScanState.error}</div>
+                    )}
+                    {!structureScanState.scanning &&
+                      visibleDefinedRecordings.map((rec) => {
+                        const wasViewed = Boolean(getRecordingViewState(rec.recordingKey));
+                        return (
+                          <button
+                            key={rec.recordingId}
+                            type="button"
+                            className="defined-rec-row"
+                            disabled={combiningBusy}
+                            onClick={() => void handleOpenDefinedRecording(rec)}
+                          >
+                            <span className="browser-icon">
+                              {rec.fileCount > 1 || rec.channelCount > 1 ? (
+                                <Layers size={14} color="#38bdf8" />
+                              ) : (
+                                <FileAudio size={14} color="#4ade80" />
+                              )}
+                            </span>
+                            <div className="defined-rec-main">
+                              <div className="defined-rec-title">{rec.title}</div>
+                              <div className="defined-rec-sub">{rec.subtitle}</div>
+                            </div>
+                            <div className="defined-rec-right mono">
+                              {rec.channelCount > 1 && (
+                                <span className="rec-ch-badge">{rec.channelCount} ch</span>
+                              )}
+                              {wasViewed && <span style={{ color: '#86efac' }}>Viewed</span>}
+                              {rec.totalSizeBytes > 0 && <span>{formatBytes(rec.totalSizeBytes)}</span>}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    {!structureScanState.scanning &&
+                      visibleDefinedRecordings.length === 0 &&
+                      !structureScanState.error && (
+                        <div className="panel-empty">
+                          No recordings match this definition or filter. Click &ldquo;Change&rdquo; to
+                          adjust the recording structure.
+                        </div>
+                      )}
+                  </>
+                ) : (
+                  <>
                 {(loading || driveLoading) && (
                   <div className="panel-empty">Loading recordings...</div>
                 )}
@@ -1428,6 +1885,8 @@ export const FileBrowserModal: React.FC = () => {
                       No matching folders or recordings in {currentFolderName}.
                     </div>
                   )}
+                  </>
+                )}
               </div>
             </>
           )}
