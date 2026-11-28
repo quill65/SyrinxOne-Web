@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   BookOpen,
@@ -58,6 +58,7 @@ import {
 import { GoogleSignInButton } from '../auth/GoogleSignInButton';
 import {
   buildStaticArchiveAbout,
+  collectSubfolderResearchText,
   discoverArchiveDocumentation,
   isDocumentationEntryName,
   type ArchiveTargetInput,
@@ -67,6 +68,7 @@ import {
   buildDefinedRecordings,
   clearSavedRecordingDefinition,
   getSavedRecordingDefinition,
+  isDiscreteTimeFolderName,
   makeStructureSourceKey,
   saveRecordingDefinition,
   scanDriveFilesForStructure,
@@ -150,7 +152,12 @@ export const FileBrowserModal: React.FC = () => {
   const [showDefinePanel, setShowDefinePanel] = useState(false);
   const [structureIncludeSubfolders, setStructureIncludeSubfolders] = useState(true);
   const [structureFiles, setStructureFiles] = useState<ScannedAudioFile[]>([]);
-  const [structureDocText, setStructureDocText] = useState('');
+  const [baseDocText, setBaseDocText] = useState('');
+  const [subfolderDocText, setSubfolderDocText] = useState('');
+  const structureDocText = useMemo(
+    () => [baseDocText, subfolderDocText].filter(Boolean).join('\n\n'),
+    [baseDocText, subfolderDocText],
+  );
   const [structureScanState, setStructureScanState] = useState<{
     scanning: boolean;
     filesFound: number;
@@ -164,6 +171,7 @@ export const FileBrowserModal: React.FC = () => {
     truncated: false,
     error: null,
   });
+  const scanRunIdRef = useRef(0);
 
   const isDriveSource = activeSourceId === 'gdrive_oauth';
   const isHttpSource = activeSourceId === 'http';
@@ -252,13 +260,33 @@ export const FileBrowserModal: React.FC = () => {
     [sources, activeSourceId],
   );
 
+  const savedSourceDescription = useMemo(() => {
+    if (activeSourceInfo?.description) return activeSourceInfo.description;
+    try {
+      const raw = localStorage.getItem('syrinxone.recentSources.v1');
+      if (!raw) return undefined;
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return undefined;
+      const match = parsed.find(
+        (item) =>
+          item &&
+          typeof item === 'object' &&
+          (item.sourceId === activeSourceId ||
+            (activeSourceDisplayName && item.displayName === activeSourceDisplayName)),
+      );
+      return typeof match?.description === 'string' ? match.description : undefined;
+    } catch {
+      return undefined;
+    }
+  }, [activeSourceInfo?.description, activeSourceId, activeSourceDisplayName, show]);
+
   const currentAboutTarget = useMemo<ArchiveTargetInput>(
     () => ({
       sourceId: activeSourceId,
       displayName: activeSourceInfo?.displayName || activeSourceDisplayName || activeSourceId,
       kind: activeSourceInfo?.kind ?? (isDriveSource ? 'gdrive' : isHttpSource ? 'http' : undefined),
       rootPath: activeSourceInfo?.rootPath,
-      description: activeSourceInfo?.description,
+      description: activeSourceInfo?.description || savedSourceDescription,
       anonymous: activeSourceInfo?.anonymous,
       currentPrefix: isDriveSource
         ? currentDriveFolder.id === 'root' || currentDriveFolder.id === 'sharedWithMe'
@@ -271,6 +299,7 @@ export const FileBrowserModal: React.FC = () => {
     [
       activeSourceId,
       activeSourceInfo,
+      savedSourceDescription,
       activeSourceDisplayName,
       isDriveSource,
       isHttpSource,
@@ -290,15 +319,21 @@ export const FileBrowserModal: React.FC = () => {
     const staticSpec = buildStaticArchiveAbout(currentAboutTarget);
     setBrowserAboutBrief(staticSpec.briefDescription);
     setBrowserDocCount(staticSpec.readmeFiles.length + staticSpec.documentationLinks.length);
-    setStructureDocText(
+    setBaseDocText(
       [staticSpec.briefDescription, ...staticSpec.deepDescription].filter(Boolean).join('\n'),
     );
+
+    if (!isDriveSource && !isHttpSource && (loading || entries.length === 0)) {
+      return () => {
+        cancelled = true;
+      };
+    }
 
     void discoverArchiveDocumentation(engine, currentAboutTarget, { readText: true }).then((spec) => {
       if (cancelled) return;
       setBrowserAboutBrief(spec.briefDescription);
       setBrowserDocCount(spec.readmeFiles.length + spec.documentationLinks.length);
-      setStructureDocText(
+      setBaseDocText(
         [
           spec.briefDescription,
           ...spec.deepDescription,
@@ -311,7 +346,7 @@ export const FileBrowserModal: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [show, engine, currentAboutTarget]);
+  }, [show, engine, currentAboutTarget, isDriveSource, isHttpSource, loading, entries.length]);
 
   const structureSourceKey = useMemo(
     () => makeStructureSourceKey(activeSourceId, isDriveSource ? currentDriveFolder.id : undefined),
@@ -330,6 +365,7 @@ export const FileBrowserModal: React.FC = () => {
     setSavedDefinition(existing);
     setShowDefinePanel(false);
     setStructureFiles([]);
+    setSubfolderDocText('');
     if (existing && existing.combineMode !== 'individual') {
       setStructureIncludeSubfolders(existing.includeSubfolders ?? true);
       setViewMode('recordings');
@@ -345,6 +381,8 @@ export const FileBrowserModal: React.FC = () => {
     seedDriveList?: DriveItem[],
   ) => {
     if (isHttpSource) return;
+    const runId = ++scanRunIdRef.current;
+    setSubfolderDocText('');
     setStructureScanState({
       scanning: true,
       filesFound: 0,
@@ -355,7 +393,9 @@ export const FileBrowserModal: React.FC = () => {
     try {
       if (isDriveSource) {
         if (!hasDriveToken) {
-          setStructureScanState((prev) => ({ ...prev, scanning: false }));
+          if (scanRunIdRef.current === runId) {
+            setStructureScanState((prev) => ({ ...prev, scanning: false }));
+          }
           return;
         }
         const driveFolderId = currentDriveFolder.id;
@@ -366,6 +406,7 @@ export const FileBrowserModal: React.FC = () => {
           includeSubfolders: includeSubs,
           seedItems: seedDriveList && seedDriveList.length > 0 ? seedDriveList : undefined,
           onProgress: (prog) => {
+            if (scanRunIdRef.current !== runId) return;
             setStructureScanState((prev) => ({
               ...prev,
               filesFound: prog.filesFound,
@@ -373,6 +414,7 @@ export const FileBrowserModal: React.FC = () => {
             }));
           },
         });
+        if (scanRunIdRef.current !== runId) return;
         setStructureFiles(res.files);
         setStructureScanState({
           scanning: false,
@@ -381,11 +423,20 @@ export const FileBrowserModal: React.FC = () => {
           truncated: res.truncated,
           error: null,
         });
+        if (res.docEntries.length > 0) {
+          void collectSubfolderResearchText(engine, currentAboutTarget, res.docEntries).then(
+            (extraDoc) => {
+              if (scanRunIdRef.current !== runId || !extraDoc) return;
+              setSubfolderDocText(extraDoc);
+            },
+          );
+        }
       } else {
         const res = await scanSourceFilesForStructure(engine, activeSourceId, targetPrefix, {
           includeSubfolders: includeSubs,
           seedEntries: seedSourceEntries && seedSourceEntries.length > 0 ? seedSourceEntries : undefined,
           onProgress: (prog) => {
+            if (scanRunIdRef.current !== runId) return;
             setStructureScanState((prev) => ({
               ...prev,
               filesFound: prog.filesFound,
@@ -393,6 +444,7 @@ export const FileBrowserModal: React.FC = () => {
             }));
           },
         });
+        if (scanRunIdRef.current !== runId) return;
         setStructureFiles(res.files);
         setStructureScanState({
           scanning: false,
@@ -401,8 +453,17 @@ export const FileBrowserModal: React.FC = () => {
           truncated: res.truncated,
           error: null,
         });
+        if (res.docEntries.length > 0) {
+          void collectSubfolderResearchText(engine, currentAboutTarget, res.docEntries).then(
+            (extraDoc) => {
+              if (scanRunIdRef.current !== runId || !extraDoc) return;
+              setSubfolderDocText(extraDoc);
+            },
+          );
+        }
       }
     } catch (err) {
+      if (scanRunIdRef.current !== runId) return;
       setStructureScanState((prev) => ({
         ...prev,
         scanning: false,
@@ -478,25 +539,43 @@ export const FileBrowserModal: React.FC = () => {
             dirParts: [],
             sizeBytes: e.sizeBytes,
           }));
-    const folderCount = isDriveSource
-      ? driveItems.filter((d) => d.isFolder).length
-      : entries.filter((e) => e.isDir && e.name !== '..').length;
+    const folderNames = isDriveSource
+      ? driveItems.filter((d) => d.isFolder).map((d) => d.name)
+      : entries.filter((e) => e.isDir && e.name !== '..').map((e) => e.name);
+    const folderCount = folderNames.length;
 
     if (currentAudio.length >= 2) {
-      const quick = analyzeRecordingStructure(currentAudio);
+      const quick = analyzeRecordingStructure(currentAudio, {
+        docText: structureDocText,
+        sourceLabel: activeSourceDisplayName,
+      });
       if (quick.detectedChannelFieldId) {
         const chField = quick.fields.find((f) => f.id === quick.detectedChannelFieldId);
-        return `Detected ${chField?.uniqueCount ?? 'multi'}-channel paired files (${chField?.sampleValues[0] ?? 'CH1'}–${chField?.sampleValues[chField.sampleValues.length - 1] ?? 'CHn'}). Define recordings to combine channels automatically.`;
+        const vals = chField?.sampleValues ?? [];
+        const rangeLabel = vals.length >= 2 ? `${vals[0]}–${vals[vals.length - 1]}` : 'multi-channel';
+        return `Detected ${chField?.uniqueCount ?? 'multi'} synchronized channels/receivers (${rangeLabel}). Define recordings to stack channels into one multi-channel recording.`;
       }
-      if (quick.hasDates && currentAudio.length >= 3) {
+      if (quick.hasDates && quick.allowTimeSlices && currentAudio.length >= 3) {
         return `Detected ${currentAudio.length} dated audio files. Define recordings to group by hour, day, month, or year.`;
       }
     }
     if (folderCount >= 2 && currentAudio.length === 0) {
-      return `Multiple folders detected (${folderCount}). Use Define Recordings to scan subfolders and group files by year, month, day, or site.`;
+      const hasTimeDirs = folderNames.some((n) => isDiscreteTimeFolderName(n));
+      return hasTimeDirs
+        ? `Multiple time-period folders detected (${folderCount}). Use Define Recordings to scan subfolders and group files by year, month, day, or site.`
+        : `Multiple folders detected (${folderCount}). Use Define Recordings to scan subfolders & docs and organize recordings.`;
     }
     return null;
-  }, [savedDefinition, isHttpSource, isDriveSource, driveItems, entries, activeSourceId]);
+  }, [
+    savedDefinition,
+    isHttpSource,
+    isDriveSource,
+    driveItems,
+    entries,
+    activeSourceId,
+    structureDocText,
+    activeSourceDisplayName,
+  ]);
 
   const visibleEntries = useMemo(() => {
     const q = filterText.trim().toLowerCase();
@@ -587,12 +666,85 @@ export const FileBrowserModal: React.FC = () => {
     return parts[parts.length - 1] ?? activeSourceDisplayName;
   }, [isDriveSource, currentDriveFolder.name, prefix, activeSourceDisplayName]);
 
+  const shouldOfferSliceOptions = useMemo(() => {
+    if (isHttpSource) return true;
+    if (windowPreset !== 'auto') return true;
+    const LONG_RECORDING_BYTES = 20 * 1024 * 1024;
+    const dirNames = isDriveSource
+      ? driveItems.filter((d) => d.isFolder).map((d) => d.name)
+      : entries.filter((e) => e.isDir && e.name !== '..').map((e) => e.name);
+    const discreteTimeFolderSet = new Set<string>();
+    for (const n of dirNames) {
+      if (isDiscreteTimeFolderName(n)) discreteTimeFolderSet.add(`cur:${n}`);
+    }
+    const prefixSegs = prefix.replace(/\\/g, '/').split('/').filter(Boolean);
+    prefixSegs.forEach((seg, idx) => {
+      if (isDiscreteTimeFolderName(seg)) discreteTimeFolderSet.add(`pfx:${idx}:${seg}`);
+    });
+    for (const f of structureFiles) {
+      f.dirParts.forEach((seg, idx) => {
+        if (isDiscreteTimeFolderName(seg)) discreteTimeFolderSet.add(`scan:${idx}:${seg}`);
+      });
+    }
+    const hasTimeDirsInView = discreteTimeFolderSet.size >= 2;
+    if (hasTimeDirsInView) return true;
+
+    if (viewMode === 'recordings' && definedRecordings.length > 0) {
+      return definedRecordings.some(
+        (r) =>
+          r.segmentCount > 1 ||
+          r.totalSizeBytes <= 0 ||
+          r.totalSizeBytes / Math.max(1, r.channelCount) > LONG_RECORDING_BYTES,
+      );
+    }
+
+    const listedAudio = isDriveSource
+      ? driveItems.filter((d) => !d.isFolder && d.kind === 'audio')
+      : entries.filter((e) => !e.isDir && e.kind === 'audio');
+    if (listedAudio.length === 0) return false;
+    if (listedAudio.some((item) => item.sizeBytes == null || item.sizeBytes <= 0)) {
+      return true;
+    }
+    if (listedAudio.some((item) => (item.sizeBytes ?? 0) > LONG_RECORDING_BYTES)) {
+      return true;
+    }
+    const totalListedBytes = listedAudio.reduce((acc, item) => acc + (item.sizeBytes ?? 0), 0);
+    if (totalListedBytes > LONG_RECORDING_BYTES) {
+      const quickCheck = analyzeRecordingStructure(
+        listedAudio.map((item) => ({
+          sourceId: isDriveSource ? 'gdrive_oauth' : activeSourceId,
+          uri: isDriveSource ? (item as DriveItem).id : (item as BrowseEntry).uri,
+          name: item.name,
+          dirParts: [],
+          sizeBytes: item.sizeBytes,
+        })),
+        { docText: structureDocText, sourceLabel: activeSourceDisplayName },
+      );
+      return quickCheck.allowTimeSlices;
+    }
+    return false;
+  }, [
+    isHttpSource,
+    windowPreset,
+    isDriveSource,
+    driveItems,
+    entries,
+    prefix,
+    structureFiles,
+    viewMode,
+    definedRecordings,
+    activeSourceId,
+    structureDocText,
+    activeSourceDisplayName,
+  ]);
+
   if (!show) return null;
 
-  const trimmedStartInput = windowStartInput.trim();
+  const effectiveWindowPreset = shouldOfferSliceOptions ? windowPreset : 'auto';
+  const trimmedStartInput = shouldOfferSliceOptions ? windowStartInput.trim() : '';
   const parsedStartDefault = parseTimeOrDateInput(windowStartInput, browserTimeCtx) ?? 0;
   const hasManualWindowOverride =
-    windowPreset !== 'auto' ||
+    effectiveWindowPreset !== 'auto' ||
     (trimmedStartInput !== '' && trimmedStartInput !== '00:00:00' && parsedStartDefault > 0);
 
   const resolveOpenOptions = (
@@ -617,10 +769,13 @@ export const FileBrowserModal: React.FC = () => {
       : browserTimeCtx;
     const parsedStart = parseTimeOrDateInput(windowStartInput, itemCtx) ?? parsedStartDefault;
     const manualStartOverride =
-      trimmedStartInput !== '' && trimmedStartInput !== '00:00:00' && parsedStart > 0;
+      shouldOfferSliceOptions &&
+      trimmedStartInput !== '' &&
+      trimmedStartInput !== '00:00:00' &&
+      parsedStart > 0;
 
     if (
-      windowPreset === 'auto' &&
+      effectiveWindowPreset === 'auto' &&
       !manualStartOverride &&
       existingKey &&
       getRecordingViewState(existingKey)
@@ -632,7 +787,7 @@ export const FileBrowserModal: React.FC = () => {
         name: fileName,
       };
     }
-    if (windowPreset === 'auto') {
+    if (effectiveWindowPreset === 'auto') {
       if (manualStartOverride) {
         const smartLen = fileName ? getSmartArchiveWindowSec(fileName, sizeBytes) : 900;
         return {
@@ -650,9 +805,9 @@ export const FileBrowserModal: React.FC = () => {
       };
     }
     const len =
-      windowPreset === 'custom'
+      effectiveWindowPreset === 'custom'
         ? Math.max(5, Math.min(86400, Math.round(customWindowSec || 900)))
-        : Math.max(5, Number(windowPreset) || 900);
+        : Math.max(5, Number(effectiveWindowPreset) || 900);
     return {
       startSec: parsedStart,
       maxDurationSec: len,
@@ -1198,13 +1353,15 @@ export const FileBrowserModal: React.FC = () => {
                     : 'Define Recordings'}
                 </button>
               )}
-              <button
-                className={`btn-small ${showSliceOptions ? 'btn-active' : ''}`}
-                onClick={() => setShowSliceOptions((v) => !v)}
-                title="Set start offset or slice duration for long recordings"
-              >
-                <SlidersHorizontal size={12} /> Slice
-              </button>
+              {shouldOfferSliceOptions && (
+                <button
+                  className={`btn-small ${showSliceOptions ? 'btn-active' : ''}`}
+                  onClick={() => setShowSliceOptions((v) => !v)}
+                  title="Set start offset or slice duration for long recordings"
+                >
+                  <SlidersHorizontal size={12} /> Slice
+                </button>
+              )}
               {!isHttpSource && (
                 <button
                   className="btn-small"
@@ -1295,7 +1452,7 @@ export const FileBrowserModal: React.FC = () => {
             </div>
           )}
 
-          {showSliceOptions && (
+          {shouldOfferSliceOptions && showSliceOptions && (
             <div className="window-inputs slice-options-bar">
               <span>View</span>
               <select

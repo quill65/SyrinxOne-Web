@@ -248,6 +248,7 @@ export class WebAudioPlayer {
   private ctx: AudioContext | null = null;
   private buffers = new Map<string, AudioBuffer>();
   private sourceNode: AudioBufferSourceNode | null = null;
+  private auxNodes: AudioNode[] = [];
   private mediaEl: HTMLAudioElement | null = null;
   private mediaBlobUrl: string | null = null;
   private rafId: number | null = null;
@@ -312,11 +313,16 @@ export class WebAudioPlayer {
     fileId: string,
     rangeStartSec?: number,
     rangeEndSec?: number,
+    channel?: number,
   ): Promise<{ buffer?: AudioBuffer; rawBytes?: ArrayBuffer; bufferStartOffsetSec: number }> {
     const isCombined = fileId.startsWith('combined::');
     const rStart = Math.max(0, rangeStartSec ?? 0);
     const rEnd = Math.max(rStart + 0.05, rangeEndSec ?? rStart + 60);
-    const cacheKey = isCombined ? `${fileId}|${rStart.toFixed(3)}|${rEnd.toFixed(3)}` : fileId;
+    const cleanCh =
+      channel !== undefined && Number.isFinite(channel) ? Math.max(0, Math.floor(channel)) : undefined;
+    const cacheKey = isCombined
+      ? `${fileId}|ch${cleanCh ?? 'all'}|${rStart.toFixed(3)}|${rEnd.toFixed(3)}`
+      : fileId;
 
     const cached = this.buffers.get(cacheKey);
     if (cached) {
@@ -325,11 +331,11 @@ export class WebAudioPlayer {
 
     const ctx = this.ensureContext();
     const rangeEngine = engine as AudioEngineClient & {
-      fetchCombinedAudioRange?: (fid: string, s: number, e: number) => Promise<ArrayBuffer>;
+      fetchCombinedAudioRange?: (fid: string, s: number, e: number, ch?: number) => Promise<ArrayBuffer>;
     };
     const arrayBuf =
       isCombined && typeof rangeEngine.fetchCombinedAudioRange === 'function'
-        ? await rangeEngine.fetchCombinedAudioRange(fileId, rStart, rEnd)
+        ? await rangeEngine.fetchCombinedAudioRange(fileId, rStart, rEnd, cleanCh)
         : await engine.fetchAudioArrayBuffer(fileId);
 
     if (arrayBuf.byteLength === 0) {
@@ -450,6 +456,7 @@ export class WebAudioPlayer {
     fileId: string,
     startSec?: number,
     endSec?: number,
+    channel?: number,
   ): Promise<void> {
     const seq = ++this.playSeq;
     this.stop(false);
@@ -458,7 +465,7 @@ export class WebAudioPlayer {
       await ctx.resume();
     }
 
-    const loaded = await this.loadBuffer(engine, fileId, startSec, endSec);
+    const loaded = await this.loadBuffer(engine, fileId, startSec, endSec, channel);
     if (seq !== this.playSeq) return;
 
     const offsetSec = loaded.bufferStartOffsetSec;
@@ -494,7 +501,20 @@ export class WebAudioPlayer {
       src.loopStart = s;
       src.loopEnd = e;
     }
-    src.connect(ctx.destination);
+
+    if (channel !== undefined && Number.isFinite(channel) && buffer.numberOfChannels > 1) {
+      const ch = Math.max(0, Math.min(buffer.numberOfChannels - 1, Math.floor(channel)));
+      const splitter = ctx.createChannelSplitter(buffer.numberOfChannels);
+      const merger = ctx.createChannelMerger(2);
+      src.connect(splitter);
+      splitter.connect(merger, ch, 0);
+      splitter.connect(merger, ch, 1);
+      merger.connect(ctx.destination);
+      this.auxNodes = [splitter, merger];
+    } else {
+      src.connect(ctx.destination);
+      this.auxNodes = [];
+    }
 
     this.sourceNode = src;
     this.startedAtCtxTime = ctx.currentTime;
@@ -553,6 +573,16 @@ export class WebAudioPlayer {
         // ignore if already stopped
       }
       this.sourceNode = null;
+    }
+    if (this.auxNodes.length > 0) {
+      for (const n of this.auxNodes) {
+        try {
+          n.disconnect();
+        } catch {
+          // ignore
+        }
+      }
+      this.auxNodes = [];
     }
     if (this.mediaEl) {
       try {

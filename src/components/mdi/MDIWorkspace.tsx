@@ -6,7 +6,7 @@ import { MDIChildWindow } from './MDIChildWindow';
 import { SpectrogramView } from '../spectrogram/SpectrogramView';
 
 const MOBILE_TAB_HEIGHT = 32;
-const MOBILE_GAIN_BAR_HEIGHT = 30;
+const MOBILE_GAIN_BAR_HEIGHT = 32;
 
 export const MDIWorkspace: React.FC = () => {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -19,8 +19,13 @@ export const MDIWorkspace: React.FC = () => {
   const focusWindow = useWorkspaceStore((s) => s.focusWindow);
   const closeWindow = useWorkspaceStore((s) => s.closeWindow);
   const updateWindowDisplaySettings = useWorkspaceStore((s) => s.updateWindowDisplaySettings);
+  const updateWindowViewRange = useWorkspaceStore((s) => s.updateWindowViewRange);
+  const resetWindowZoom = useWorkspaceStore((s) => s.resetWindowZoom);
+  const logActiveSelection = useWorkspaceStore((s) => s.logActiveSelection);
   const windowAutoGainMode = useWorkspaceStore((s) => s.windowAutoGainMode);
   const setWindowAutoGainMode = useWorkspaceStore((s) => s.setWindowAutoGainMode);
+  const touchMode = useWorkspaceStore((s) => s.touchMode);
+  const setTouchMode = useWorkspaceStore((s) => s.setTouchMode);
   const openUploadedFile = useWorkspaceStore((s) => s.openUploadedFile);
   const importAnnotationsFromText = useWorkspaceStore((s) => s.importAnnotationsFromText);
   const setModalState = useWorkspaceStore((s) => s.setModalState);
@@ -64,6 +69,31 @@ export const MDIWorkspace: React.FC = () => {
   const activeMobileWin =
     windows.find((w) => w.windowId === activeWindowId) ?? windows[windows.length - 1];
   const activeMobileFile = activeMobileWin ? files[activeMobileWin.fileId] : undefined;
+
+  const zoomMobileTimeBy = (factor: number) => {
+    if (!activeMobileWin || !activeMobileFile) return;
+    const splitRows = Math.max(
+      1,
+      Math.min(10, Math.round(activeMobileWin.displaySettings.splitTimeRows ?? 1)),
+    );
+    const s = activeMobileWin.viewRange.startSec;
+    const e = activeMobileWin.viewRange.endSec;
+    const span = Math.max(1e-6, e - s);
+    const mid = 0.5 * (s + e);
+    const nextSpan = Math.max(
+      0.02 * splitRows,
+      Math.min(activeMobileFile.durationSec, span * factor),
+    );
+    const ns = Math.max(
+      0,
+      Math.min(Math.max(0, activeMobileFile.durationSec - nextSpan), mid - nextSpan / 2),
+    );
+    updateWindowViewRange(activeMobileWin.windowId, {
+      ...activeMobileWin.viewRange,
+      startSec: ns,
+      endSec: Math.min(activeMobileFile.durationSec, ns + nextSpan),
+    });
+  };
 
   return (
     <div
@@ -123,38 +153,89 @@ export const MDIWorkspace: React.FC = () => {
             </button>
           </div>
           <div className="mobile-gain-bar">
-            <span className="mobile-gain-label">Gain</span>
-            <input
-              type="range"
-              className="mobile-gain-slider"
-              min={SPECTROGRAM_GAIN_MIN_DB}
-              max={SPECTROGRAM_GAIN_MAX_DB}
-              step={1}
-              value={activeMobileWin.displaySettings.gainDb}
-              onChange={(e) =>
-                updateWindowDisplaySettings(activeMobileWin.windowId, {
-                  gainDb: Number(e.target.value),
-                })
-              }
-              aria-label="Spectrogram Gain"
-            />
-            <span className="mobile-gain-val">
-              {activeMobileWin.displaySettings.gainDb >= 0
-                ? `+${activeMobileWin.displaySettings.gainDb.toFixed(0)}`
-                : activeMobileWin.displaySettings.gainDb.toFixed(0)}{' '}
-              dB
-            </span>
-            <button
-              type="button"
-              className={`mobile-auto-gain-btn ${(windowAutoGainMode[activeMobileWin.windowId] ?? 'manual') === 'auto' ? 'btn-active' : ''}`}
-              onClick={() => {
-                const cur = windowAutoGainMode[activeMobileWin.windowId] ?? 'manual';
-                setWindowAutoGainMode(activeMobileWin.windowId, cur === 'auto' ? 'manual' : 'auto');
-              }}
-              title="Toggle Auto Gain"
-            >
-              <Sparkles size={12} /> Auto
-            </button>
+            <div className="mobile-gain-group">
+              <span className="mobile-gain-label">Gain</span>
+              <input
+                type="range"
+                className="mobile-gain-slider"
+                min={SPECTROGRAM_GAIN_MIN_DB}
+                max={SPECTROGRAM_GAIN_MAX_DB}
+                step={1}
+                value={activeMobileWin.displaySettings.gainDb}
+                onChange={(e) =>
+                  updateWindowDisplaySettings(activeMobileWin.windowId, {
+                    gainDb: Number(e.target.value),
+                  })
+                }
+                aria-label="Spectrogram Gain"
+              />
+              <span className="mobile-gain-val">
+                {activeMobileWin.displaySettings.gainDb >= 0
+                  ? `+${activeMobileWin.displaySettings.gainDb.toFixed(0)}`
+                  : activeMobileWin.displaySettings.gainDb.toFixed(0)}
+              </span>
+              <button
+                type="button"
+                className={`mobile-auto-gain-btn ${(windowAutoGainMode[activeMobileWin.windowId] ?? 'manual') === 'auto' ? 'btn-active' : ''}`}
+                onClick={() => {
+                  const cur = windowAutoGainMode[activeMobileWin.windowId] ?? 'manual';
+                  setWindowAutoGainMode(activeMobileWin.windowId, cur === 'auto' ? 'manual' : 'auto');
+                }}
+                title="Toggle Auto Gain"
+              >
+                <Sparkles size={11} /> Auto
+              </button>
+            </div>
+            <div className="mobile-bar-actions">
+              <button
+                type="button"
+                className={`btn-small ${touchMode === 'select' ? 'btn-active' : ''}`}
+                onClick={() => setTouchMode('select')}
+              >
+                Select
+              </button>
+              <button
+                type="button"
+                className={`btn-small ${touchMode === 'pan' ? 'btn-active' : ''}`}
+                onClick={() => setTouchMode('pan')}
+              >
+                Pan
+              </button>
+              <button
+                type="button"
+                className="btn-small"
+                onClick={() => zoomMobileTimeBy(0.6)}
+                title="Zoom in"
+              >
+                +
+              </button>
+              <button
+                type="button"
+                className="btn-small"
+                onClick={() => zoomMobileTimeBy(1.6)}
+                title="Zoom out"
+              >
+                −
+              </button>
+              <button
+                type="button"
+                className="btn-small"
+                onClick={() => resetWindowZoom(activeMobileWin.windowId)}
+                title="Reset zoom"
+              >
+                Fit
+              </button>
+              {activeMobileWin.selection && (
+                <button
+                  type="button"
+                  className="btn-small btn-primary"
+                  onClick={() => logActiveSelection('')}
+                  title="Log current selection"
+                >
+                  +Log
+                </button>
+              )}
+            </div>
           </div>
           <div className="mobile-spec-stage">
             <SpectrogramView

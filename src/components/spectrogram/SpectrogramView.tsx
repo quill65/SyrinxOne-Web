@@ -37,6 +37,7 @@ const COMPACT_AXIS_BOTTOM = 18;
 const SCROLLBAR_HEIGHT = 12;
 const WAVEFORM_HEIGHT = 54;
 const ROW_GAP = 4;
+const CHANNEL_GAP = 2;
 const HANDLE_RADIUS = 6;
 
 type HandleId = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
@@ -44,6 +45,7 @@ type HandleId = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 interface ContextMenuState {
   x: number;
   y: number;
+  rowChannel: number;
   annotation: AnnotationRecord | null;
 }
 
@@ -62,6 +64,8 @@ interface RowLayout {
   plotH: number;
   axisBottomH: number;
   rowBottom: number;
+  gapAfter: number;
+  isChannelSeparator: boolean;
   badgeText: string;
 }
 
@@ -152,16 +156,17 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
   const setError = useWorkspaceStore((s) => s.setError);
   const autoGainMode = useWorkspaceStore((s) => s.windowAutoGainMode[win.windowId] ?? 'manual');
   const autoGainWindow = useWorkspaceStore((s) => s.autoGainWindow);
+  const touchMode = useWorkspaceStore((s) => s.touchMode);
 
   const [playback, setPlayback] = useState<PlaybackState>(() => audioPlayer.getState());
   const [cursorStyle, setCursorStyle] = useState<string>('crosshair');
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
-  const [touchMode, setTouchMode] = useState<'select' | 'pan'>('select');
   const [zoomMatrices, setZoomMatrices] = useState<Record<number, SpectrogramMatrix>>({});
   const zoomMatricesRef = useRef<Record<number, SpectrogramMatrix>>({});
   zoomMatricesRef.current = zoomMatrices;
 
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const lastTapRef = useRef<number>(0);
   const pinchRef = useRef<{
     distX: number;
@@ -179,6 +184,15 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         startX: number;
         startY: number;
         origRange: MDIWindowState['viewRange'];
+      }
+    | {
+        kind: 'scroll_outside';
+        startX: number;
+        startY: number;
+        lastY: number;
+        startScrollTop: number;
+        origRange: MDIWindowState['viewRange'];
+        zone: 'gutter' | 'wave' | 'axis';
       }
     | {
         kind: 'resize_sel';
@@ -404,27 +418,35 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
   // Compute single or stacked row layout geometry
   const { rows, stageW, stageH, plotW, isVertScrollable } = useMemo(() => {
     const isMulti = totalRows > 1;
+    const chPerTimeGroup = Math.max(1, displayedChannels.length);
     const perRowWaveH = showWave
       ? isMulti
         ? totalRows <= 4
           ? 26
-          : 18
+          : 20
         : WAVEFORM_HEIGHT
       : 0;
-    const perRowAxisBottomH = showAxes ? (isMulti ? COMPACT_AXIS_BOTTOM : AXIS_BOTTOM) : 0;
-    const gap = isMulti ? ROW_GAP : 0;
+    const groupAxisBottomH = showAxes
+      ? splitTimeRows > 1
+        ? COMPACT_AXIS_BOTTOM
+        : AXIS_BOTTOM
+      : 0;
+
+    const totalOverhead =
+      totalRows * perRowWaveH +
+      splitTimeRows * (groupAxisBottomH + (chPerTimeGroup - 1) * CHANNEL_GAP) +
+      Math.max(0, splitTimeRows - 1) * ROW_GAP;
 
     let perRowPlotH: number;
     let totalStageH: number;
     if (!isMulti) {
-      perRowPlotH = Math.max(40, viewportH - perRowWaveH - perRowAxisBottomH);
+      perRowPlotH = Math.max(40, viewportH - totalOverhead);
       totalStageH = viewportH;
     } else {
-      const minPlotH = totalRows <= 3 ? 88 : 74;
-      const overhead = totalRows * (perRowWaveH + perRowAxisBottomH) + (totalRows - 1) * gap;
-      const fitPlotH = Math.floor((viewportH - overhead) / totalRows);
+      const minPlotH = totalRows <= 3 ? 88 : totalRows <= 6 ? 68 : 56;
+      const fitPlotH = Math.floor((viewportH - totalOverhead) / totalRows);
       perRowPlotH = Math.max(minPlotH, fitPlotH);
-      totalStageH = Math.max(viewportH, totalRows * (perRowWaveH + perRowPlotH + perRowAxisBottomH) + (totalRows - 1) * gap);
+      totalStageH = Math.max(viewportH, totalRows * perRowPlotH + totalOverhead);
     }
 
     const vertScroll = totalStageH > viewportH + 1;
@@ -446,12 +468,19 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
           ? formatRecordingRange(windowOffsetSec + rStart, windowOffsetSec + rEnd, totalDur, timeCtx)
           : null;
 
-      for (const ch of displayedChannels) {
+      for (let chIdx = 0; chIdx < displayedChannels.length; chIdx++) {
+        const ch = displayedChannels[chIdx];
         const idx = list.length;
+        const isLastInGroup = chIdx === displayedChannels.length - 1;
+        const rowWaveH = perRowWaveH;
+        const rowAxisBottomH = isLastInGroup ? groupAxisBottomH : 0;
+        const gapAfter =
+          idx === totalRows - 1 ? 0 : isLastInGroup ? ROW_GAP : CHANNEL_GAP;
+
         const rowTop = cursorY;
         const waveTop = rowTop;
-        const plotTop = rowTop + perRowWaveH;
-        const rowBottom = plotTop + perRowPlotH + perRowAxisBottomH;
+        const plotTop = rowTop + rowWaveH;
+        const rowBottom = plotTop + perRowPlotH + rowAxisBottomH;
 
         const parts: string[] = [];
         if (stackChannels) parts.push(`Ch ${ch + 1}`);
@@ -469,15 +498,17 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
           maxFreqHz,
           rowTop,
           waveTop,
-          waveH: perRowWaveH,
+          waveH: rowWaveH,
           plotTop,
           plotH: perRowPlotH,
-          axisBottomH: perRowAxisBottomH,
+          axisBottomH: rowAxisBottomH,
           rowBottom,
+          gapAfter,
+          isChannelSeparator: !isLastInGroup,
           badgeText: parts.join(' · '),
         });
 
-        cursorY = rowBottom + gap;
+        cursorY = rowBottom + gapAfter;
       }
     }
 
@@ -528,6 +559,11 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     });
   }, [annotations, file.name, annotationFilter]);
 
+  const hasChannelSelectionHighlight = Boolean(
+    stackChannels && win.selection && win.displaySettings.showCursors,
+  );
+  const selectedChannelNum = win.selection?.channel;
+
   const webglRows: SpectrogramRenderRow[] = useMemo(() => {
     return rows.map((row) => {
       const mat = activeMatricesByChannel[row.channel];
@@ -555,7 +591,14 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         bitmapFallbackUrl,
       };
     });
-  }, [rows, activeMatricesByChannel, win.displaySettings, win.specParams, engine, file.fileId]);
+  }, [
+    rows,
+    activeMatricesByChannel,
+    win.displaySettings,
+    win.specParams,
+    engine,
+    file.fileId,
+  ]);
 
   const playheadSec =
     playback.isPlaying && playback.fileId === file.fileId ? playback.currentTimeSec : null;
@@ -600,15 +643,19 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
 
       if (showAxes) {
         ctx.fillStyle = '#0f141b';
-        ctx.fillRect(0, row.rowTop, leftPad, row.rowBottom - row.rowTop);
-        ctx.fillRect(0, row.plotTop + row.plotH, stageW, row.axisBottomH);
+        ctx.fillRect(0, row.rowTop, leftPad, row.rowBottom + row.gapAfter - row.rowTop);
+        if (row.axisBottomH > 0) {
+          ctx.fillRect(0, row.plotTop + row.plotH, stageW, row.axisBottomH);
+        }
 
         ctx.strokeStyle = '#293548';
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(leftPad + 0.5, row.rowTop);
         ctx.lineTo(leftPad + 0.5, row.plotTop + row.plotH);
-        ctx.lineTo(stageW, row.plotTop + row.plotH + 0.5);
+        if (row.axisBottomH > 0) {
+          ctx.lineTo(stageW, row.plotTop + row.plotH + 0.5);
+        }
         ctx.stroke();
 
         const fTicks = computeNiceTicks(
@@ -623,7 +670,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
 
         for (const f of fTicks) {
           const y = rowFreqToY(row, f);
-          if (y < row.plotTop + 6 || y > row.plotTop + row.plotH - 6) continue;
+          if (y < row.plotTop + 7 || y > row.plotTop + row.plotH - 7) continue;
           const label = f >= 1000 ? `${(f / 1000).toFixed(1)}k` : `${Math.round(f)}`;
           ctx.fillText(label, leftPad - 6, y);
           ctx.strokeStyle = '#475569';
@@ -644,18 +691,21 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         const tTicks = computeNiceTicks(row.startSec, row.endSec, Math.floor(plotW / tickSpacing));
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
-        const labelTopY = row.plotTop + row.plotH + (isMulti ? 3 : 6);
+        const labelTopY = row.plotTop + row.plotH + (row.axisBottomH <= COMPACT_AXIS_BOTTOM ? 3 : 6);
         for (const t of tTicks) {
           const x = rowTimeToX(row, t);
           if (x < leftPad + edgePad || x > stageW - edgePad) continue;
-          ctx.fillStyle = '#94a3b8';
-          const label = formatAxisTickTime(windowOffsetSec + t, rSpanT, timeCtx);
-          ctx.fillText(label, x, labelTopY);
-          ctx.strokeStyle = '#475569';
-          ctx.beginPath();
-          ctx.moveTo(x, row.plotTop + row.plotH);
-          ctx.lineTo(x, row.plotTop + row.plotH + 3);
-          ctx.stroke();
+
+          if (row.axisBottomH > 0) {
+            ctx.fillStyle = '#94a3b8';
+            const label = formatAxisTickTime(windowOffsetSec + t, rSpanT, timeCtx);
+            ctx.fillText(label, x, labelTopY);
+            ctx.strokeStyle = '#475569';
+            ctx.beginPath();
+            ctx.moveTo(x, row.plotTop + row.plotH);
+            ctx.lineTo(x, row.plotTop + row.plotH + 3);
+            ctx.stroke();
+          }
 
           if (win.displaySettings.showGrid) {
             ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
@@ -720,26 +770,30 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         const s = win.selection;
         const s0 = Math.min(s.startSec, s.endSec);
         const s1 = Math.max(s.startSec, s.endSec);
-        const channelMatch = !stackChannels || s.channel === row.channel + 1;
-        if (channelMatch && s1 >= row.startSec && s0 <= row.endSec) {
+        const isSelectedChannel = !stackChannels || s.channel === row.channel + 1;
+        if (s1 >= row.startSec && s0 <= row.endSec) {
           const x0 = rowTimeToX(row, s0);
           const x1 = rowTimeToX(row, s1);
           const yTop = rowFreqToY(row, Math.max(s.lowFreqHz, s.highFreqHz));
           const yBot = rowFreqToY(row, Math.min(s.lowFreqHz, s.highFreqHz));
-          ctx.fillStyle = 'rgba(56, 189, 248, 0.16)';
-          ctx.strokeStyle = '#38bdf8';
-          ctx.lineWidth = 1.5;
+          ctx.fillStyle = isSelectedChannel
+            ? 'rgba(56, 189, 248, 0.16)'
+            : 'rgba(56, 189, 248, 0.10)';
+          ctx.strokeStyle = isSelectedChannel ? '#38bdf8' : 'rgba(56, 189, 248, 0.85)';
+          ctx.lineWidth = isSelectedChannel ? 1.5 : 1.25;
           ctx.setLineDash([4, 3]);
           ctx.fillRect(x0, yTop, Math.max(2, x1 - x0), Math.max(2, yBot - yTop));
           ctx.strokeRect(x0, yTop, Math.max(2, x1 - x0), Math.max(2, yBot - yTop));
           ctx.setLineDash([]);
 
-          ctx.fillStyle = '#38bdf8';
-          ctx.strokeStyle = '#0f172a';
-          ctx.lineWidth = 1;
-          for (const h of getBoxHandles(x0, yTop, x1, yBot)) {
-            ctx.fillRect(h.x - 3, h.y - 3, 6, 6);
-            ctx.strokeRect(h.x - 3, h.y - 3, 6, 6);
+          if (isSelectedChannel) {
+            ctx.fillStyle = '#38bdf8';
+            ctx.strokeStyle = '#0f172a';
+            ctx.lineWidth = 1;
+            for (const h of getBoxHandles(x0, yTop, x1, yBot)) {
+              ctx.fillRect(h.x - 3, h.y - 3, 6, 6);
+              ctx.strokeRect(h.x - 3, h.y - 3, 6, 6);
+            }
           }
         }
       }
@@ -756,18 +810,22 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
 
       // Row identification badge when viewing split time rows or stacked channels
       if (isMulti && row.badgeText) {
+        const isActiveRow =
+          hasChannelSelectionHighlight && selectedChannelNum === row.channel + 1;
         ctx.font = '600 10px ui-monospace, SFMono-Regular, Menlo, monospace';
         const padX = 5;
         const textW = ctx.measureText(row.badgeText).width;
         const boxW = Math.min(plotW - 12, textW + padX * 2);
         const bx = leftPad + 5;
         const by = row.plotTop + 4;
-        ctx.fillStyle = 'rgba(15, 23, 42, 0.84)';
-        ctx.strokeStyle = 'rgba(71, 85, 105, 0.75)';
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.86)';
+        ctx.strokeStyle = isActiveRow
+          ? 'rgba(56, 189, 248, 0.9)'
+          : 'rgba(71, 85, 105, 0.75)';
         ctx.lineWidth = 1;
         ctx.fillRect(bx, by, boxW, 15);
         ctx.strokeRect(bx, by, boxW, 15);
-        ctx.fillStyle = '#e2e8f0';
+        ctx.fillStyle = isActiveRow ? '#bae6fd' : '#e2e8f0';
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
         ctx.fillText(row.badgeText, bx + padX, by + 7.5, Math.max(10, boxW - padX * 2));
@@ -775,10 +833,22 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
 
       ctx.restore();
 
-      // Inter-row separator line
-      if (row.rowIndex < rows.length - 1) {
-        const sepY = row.rowBottom + ROW_GAP / 2;
-        ctx.strokeStyle = '#1e293b';
+      // Subtle border between a channel's waveform strip and spectrogram plot
+      if (row.waveH > 0) {
+        ctx.strokeStyle = '#263244';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(leftPad, row.plotTop + 0.5);
+        ctx.lineTo(stageW, row.plotTop + 0.5);
+        ctx.stroke();
+      }
+
+      // Inter-row separator line (narrow 1px divider between stacked channels)
+      if (row.gapAfter > 0) {
+        const sepY = row.rowBottom + row.gapAfter / 2;
+        ctx.fillStyle = '#0b1017';
+        ctx.fillRect(leftPad, row.rowBottom, plotW, row.gapAfter);
+        ctx.strokeStyle = row.isChannelSeparator ? '#334155' : '#1e293b';
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(0, sepY);
@@ -811,7 +881,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
       return rows[anchorRowIndex];
     }
     for (const r of rows) {
-      if (rawY >= r.rowTop && rawY <= r.rowBottom + ROW_GAP) {
+      if (rawY >= r.rowTop && rawY <= r.rowBottom + r.gapAfter) {
         return r;
       }
     }
@@ -1012,7 +1082,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     const pt = coordsToRowTimeFreq(
       e.clientX,
       e.clientY,
-      drag ? drag.anchorRowIndex : undefined,
+      drag && drag.kind !== 'scroll_outside' ? drag.anchorRowIndex : undefined,
     );
 
     if (pt && pt.inPlot) {
@@ -1150,8 +1220,8 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     }
   };
 
-  const playRange = (s?: number, e?: number) => {
-    void audioPlayer.play(engine, file.fileId, s, e).catch((err) => {
+  const playRange = (s?: number, e?: number, ch?: number) => {
+    void audioPlayer.play(engine, file.fileId, s, e, ch).catch((err) => {
       setError(err instanceof Error ? err.message : 'Unable to play audio');
     });
   };
@@ -1164,11 +1234,15 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     if (hit) {
       const winOff = file.windowStartSec ?? 0;
       selectAnnotation(hit.id, false);
-      playRange(Math.max(0, hit.startTimeSec - winOff), Math.max(0.05, hit.endTimeSec - winOff));
+      playRange(
+        Math.max(0, hit.startTimeSec - winOff),
+        Math.max(0.05, hit.endTimeSec - winOff),
+        hit.channel ? Math.max(0, hit.channel - 1) : pt.row.channel,
+      );
     } else if (splitTimeRows > 1) {
-      playRange(pt.row.startSec, pt.row.endSec);
+      playRange(pt.row.startSec, pt.row.endSec, pt.row.channel);
     } else {
-      playRange(win.viewRange.startSec, win.viewRange.endSec);
+      playRange(win.viewRange.startSec, win.viewRange.endSec, pt.row.channel);
     }
   };
 
@@ -1177,7 +1251,12 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     const pt = coordsToRowTimeFreq(e.clientX, e.clientY);
     const hit = pt ? findAnnotationAt(pt.row.channel, pt.timeSec, pt.freqHz) ?? null : null;
     if (hit) selectAnnotation(hit.id, false);
-    setContextMenu({ x: e.clientX, y: e.clientY, annotation: hit });
+    setContextMenu({
+      x: e.clientX,
+      y: e.clientY,
+      rowChannel: pt?.row.channel ?? win.specParams.channel,
+      annotation: hit,
+    });
   };
 
   const handleCopyImage = async () => {
@@ -1239,6 +1318,30 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     }
     if (e.touches.length !== 1) return;
 
+    const touch = e.touches[0];
+    if (window.innerWidth <= 768 && (touch.clientX <= 16 || touch.clientX >= window.innerWidth - 16)) {
+      return;
+    }
+    const pt = coordsToRowTimeFreq(touch.clientX, touch.clientY);
+
+    // Outside the spectrogram plot area where cursors/selections are drawn:
+    // allow scrolling (vertical across channels/containers + horizontal along time axes).
+    if (!pt || !pt.inPlot) {
+      lastTapRef.current = 0;
+      const zone: 'gutter' | 'wave' | 'axis' =
+        pt && pt.x < 0 ? 'gutter' : pt && pt.y < 0 ? 'wave' : 'axis';
+      dragModeRef.current = {
+        kind: 'scroll_outside',
+        startX: touch.clientX,
+        startY: touch.clientY,
+        lastY: touch.clientY,
+        startScrollTop: stageRef.current?.scrollTop ?? 0,
+        origRange: { ...win.viewRange },
+        zone,
+      };
+      return;
+    }
+
     const now = Date.now();
     if (now - lastTapRef.current < 280) {
       lastTapRef.current = 0;
@@ -1246,20 +1349,14 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
         playRange(
           Math.min(win.selection.startSec, win.selection.endSec),
           Math.max(win.selection.startSec, win.selection.endSec),
+          Math.max(0, win.selection.channel - 1),
         );
       } else {
-        playRange(startSec, endSec);
+        playRange(startSec, endSec, pt.row.channel);
       }
       return;
     }
     lastTapRef.current = now;
-
-    const touch = e.touches[0];
-    if (window.innerWidth <= 768 && (touch.clientX <= 24 || touch.clientX >= window.innerWidth - 24)) {
-      return;
-    }
-    const pt = coordsToRowTimeFreq(touch.clientX, touch.clientY);
-    if (!pt || !pt.inPlot) return;
 
     if (touchMode === 'pan') {
       dragModeRef.current = {
@@ -1319,6 +1416,69 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     e.preventDefault();
     const touch = e.touches[0];
     const mode = dragModeRef.current;
+
+    if (mode.kind === 'scroll_outside') {
+      const dx = touch.clientX - mode.startX;
+      const dy = touch.clientY - mode.startY;
+      const stepY = touch.clientY - mode.lastY;
+      mode.lastY = touch.clientY;
+
+      const orig = mode.origRange;
+      const oSpanT = orig.endSec - orig.startSec;
+      const canScrollHoriz =
+        oSpanT < file.durationSec - 0.005 &&
+        mode.zone !== 'gutter' &&
+        Math.abs(dx) > Math.abs(dy) * 1.15 &&
+        Math.abs(dx) > 6;
+
+      if (canScrollHoriz) {
+        const rowSpanT = oSpanT / splitTimeRows;
+        const dt = -(dx / Math.max(1, plotW)) * rowSpanT;
+        const ns = Math.max(0, Math.min(Math.max(0, file.durationSec - oSpanT), orig.startSec + dt));
+        updateWindowViewRange(win.windowId, {
+          ...orig,
+          startSec: ns,
+          endSec: Math.min(file.durationSec, ns + oSpanT),
+        });
+        return;
+      }
+
+      const stage = stageRef.current;
+      let consumed = false;
+      if (stage && stage.scrollHeight > stage.clientHeight + 1) {
+        const maxTop = stage.scrollHeight - stage.clientHeight;
+        const targetTop = Math.max(0, Math.min(maxTop, mode.startScrollTop - dy));
+        if (Math.abs(targetTop - stage.scrollTop) >= 0.5) {
+          stage.scrollTop = targetTop;
+          consumed = true;
+        }
+      }
+      if (!consumed && Math.abs(stepY) >= 0.5) {
+        let el: HTMLElement | null = stage?.parentElement ?? null;
+        while (el) {
+          if (el.scrollHeight > el.clientHeight + 1) {
+            const ov = window.getComputedStyle(el).overflowY;
+            if (ov === 'auto' || ov === 'scroll') {
+              const before = el.scrollTop;
+              el.scrollTop = Math.max(
+                0,
+                Math.min(el.scrollHeight - el.clientHeight, before - stepY),
+              );
+              if (Math.abs(el.scrollTop - before) >= 0.5) {
+                consumed = true;
+                break;
+              }
+            }
+          }
+          el = el.parentElement;
+        }
+        if (!consumed) {
+          window.scrollBy(0, -stepY);
+        }
+      }
+      return;
+    }
+
     const pt = coordsToRowTimeFreq(touch.clientX, touch.clientY, mode.anchorRowIndex);
     if (!pt) return;
 
@@ -1353,17 +1513,6 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
     pinchRef.current = null;
   };
 
-  const zoomTimeBy = (factor: number) => {
-    const mid = 0.5 * (startSec + endSec);
-    const nextSpan = Math.max(0.02 * splitTimeRows, Math.min(file.durationSec, spanT * factor));
-    const ns = Math.max(0, Math.min(Math.max(0, file.durationSec - nextSpan), mid - nextSpan / 2));
-    updateWindowViewRange(win.windowId, {
-      ...win.viewRange,
-      startSec: ns,
-      endSec: Math.min(file.durationSec, ns + nextSpan),
-    });
-  };
-
   return (
     <div
       className="spec-view-root"
@@ -1374,6 +1523,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
       }}
     >
       <div
+        ref={stageRef}
         className="spec-rows-stage"
         style={{
           position: 'relative',
@@ -1388,21 +1538,27 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
             position: 'relative',
             width: `${stageW}px`,
             height: `${stageH}px`,
+            background: '#0b0f14',
           }}
         >
+          <div style={{ position: 'absolute', left: leftPad, top: 0, zIndex: 1 }}>
+            <WebGLSpectrogramCanvas
+              rows={webglRows}
+              displaySettings={win.displaySettings}
+              width={plotW}
+              height={stageH}
+            />
+          </div>
+
           {showWave &&
             rows.map((row) => {
+              if (row.waveH <= 0) return null;
               const wf = waveformCache[`${file.fileId}|${row.channel}`];
-              const rowSel =
-                win.displaySettings.showCursors &&
-                win.selection &&
-                (!stackChannels || win.selection.channel === row.channel + 1)
-                  ? win.selection
-                  : null;
+              const rowSel = win.displaySettings.showCursors ? win.selection : null;
               return (
                 <div
                   key={`wf-${row.rowIndex}`}
-                  style={{ position: 'absolute', left: leftPad, top: row.waveTop }}
+                  style={{ position: 'absolute', left: leftPad, top: row.waveTop, zIndex: 2 }}
                 >
                   <WaveformCanvas
                     waveform={wf}
@@ -1421,15 +1577,6 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
               );
             })}
 
-          <div style={{ position: 'absolute', left: leftPad, top: 0 }}>
-            <WebGLSpectrogramCanvas
-              rows={webglRows}
-              displaySettings={win.displaySettings}
-              width={plotW}
-              height={stageH}
-            />
-          </div>
-
           <canvas
             ref={overlayRef}
             style={{
@@ -1438,6 +1585,7 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
               top: 0,
               width: `${stageW}px`,
               height: `${stageH}px`,
+              zIndex: 3,
               cursor: cursorStyle,
               touchAction: isVertScrollable && touchMode === 'pan' ? 'pan-y' : 'none',
             }}
@@ -1452,39 +1600,6 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
             onTouchEnd={handleTouchEnd}
           />
         </div>
-      </div>
-
-      <div className="mobile-touch-hud">
-        <button
-          className={`btn-small ${touchMode === 'select' ? 'btn-active' : ''}`}
-          onClick={() => setTouchMode('select')}
-        >
-          Select
-        </button>
-        <button
-          className={`btn-small ${touchMode === 'pan' ? 'btn-active' : ''}`}
-          onClick={() => setTouchMode('pan')}
-        >
-          Pan
-        </button>
-        <button className="btn-small" onClick={() => zoomTimeBy(0.6)} title="Zoom in">
-          +
-        </button>
-        <button className="btn-small" onClick={() => zoomTimeBy(1.6)} title="Zoom out">
-          −
-        </button>
-        <button className="btn-small" onClick={() => resetWindowZoom(win.windowId)} title="Reset zoom">
-          Fit
-        </button>
-        {win.selection && (
-          <button
-            className="btn-small btn-primary"
-            onClick={() => logActiveSelection('')}
-            title="Log current selection"
-          >
-            +Log
-          </button>
-        )}
       </div>
 
       {needsScrollbar && (
@@ -1532,7 +1647,12 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
               <button
                 onClick={() => {
                   const a = contextMenu.annotation!;
-                  playRange(a.startTimeSec, a.endTimeSec);
+                  const winOff = file.windowStartSec ?? 0;
+                  playRange(
+                    Math.max(0, a.startTimeSec - winOff),
+                    Math.max(0.05, a.endTimeSec - winOff),
+                    a.channel ? Math.max(0, a.channel - 1) : contextMenu.rowChannel,
+                  );
                   setContextMenu(null);
                 }}
               >
@@ -1591,9 +1711,10 @@ export const SpectrogramView: React.FC<Props> = ({ win, file, width, height }) =
                 playRange(
                   Math.min(win.selection.startSec, win.selection.endSec),
                   Math.max(win.selection.startSec, win.selection.endSec),
+                  Math.max(0, win.selection.channel - 1),
                 );
               } else {
-                playRange(startSec, endSec);
+                playRange(startSec, endSec, contextMenu.rowChannel);
               }
               setContextMenu(null);
             }}

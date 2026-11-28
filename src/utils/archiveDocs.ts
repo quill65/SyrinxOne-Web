@@ -281,8 +281,10 @@ const CURATED_ARCHIVES: Record<string, CuratedArchiveMeta> = {
 
 const AUDIO_EXT_RE = /\.(wav|flac|aif|aiff|ogg|mp3|m4a|opus)$/i;
 const DOC_NAME_RE =
-  /^(readme|about|metadata|notes?|doc(s|umentation)?|citation|license|changelog|manifest|calibration|guide)([._-].*)?$/i;
+  /^(readme|about|metadata|notes?|doc(s|umentation)?|citation|license|changelog|manifest|calibration|guide|tutorial|array)([._-].*)?$/i;
 const DOC_EXT_RE = /\.(md|markdown|pdf|txt|rst|html?)$/i;
+const METADATA_STRUCT_RE =
+  /^(aru[_-]?coords?|coords?|coordinates?|receivers?|channels?|sensors?|nodes?|stations?|deployments?|sites?|metadata|manifest|datapackage|detections?)\.(csv|tsv|json)$/i;
 
 export function isDocumentationEntryName(name: string): boolean {
   const clean = name.replace(/\/+$/, '').trim();
@@ -290,8 +292,15 @@ export function isDocumentationEntryName(name: string): boolean {
   const base = clean.includes('/') ? clean.slice(clean.lastIndexOf('/') + 1) : clean;
   const stem = base.replace(/\.[a-z0-9]{1,8}$/i, '');
   if (DOC_NAME_RE.test(stem) || DOC_NAME_RE.test(base)) return true;
-  if (/\.(md|markdown|pdf|rst)$/i.test(base)) return true;
+  if (/\.(md|markdown|pdf|rst|txt)$/i.test(base)) return true;
   return false;
+}
+
+export function isStructuredMetadataEntryName(name: string): boolean {
+  const clean = name.replace(/\/+$/, '').trim();
+  if (!clean || clean === '..' || AUDIO_EXT_RE.test(clean)) return false;
+  const base = clean.includes('/') ? clean.slice(clean.lastIndexOf('/') + 1) : clean;
+  return METADATA_STRUCT_RE.test(base) || /\.(csv|tsv)$/i.test(base);
 }
 
 export function buildPublicObjectUrl(
@@ -314,6 +323,11 @@ export function buildPublicObjectUrl(
   }
   if (cloudType === 's3') {
     return `https://${bucket}.s3.${region}.amazonaws.com/${cleanUri}`;
+  }
+  const folderOrUrl = target.connectReq?.folderOrUrl?.trim() ?? '';
+  const zenMatch = folderOrUrl.match(/zenodo\.org\/(?:records?|record)\/(\d+)/i);
+  if (zenMatch && cleanUri && !cleanUri.includes('://')) {
+    return `https://zenodo.org/records/${zenMatch[1]}/files/${encodeURIComponent(cleanUri)}?download=1`;
   }
   return undefined;
 }
@@ -491,7 +505,7 @@ export async function fetchDocTextPreview(
     }
   }
 
-  // 3. Fallback for local/connected engine text files via importAnnotationsFromSource nonAnnotationLines
+  // 3. Fallback for local/connected engine text files via importAnnotationsFromSource
   if (target.sourceId && target.sourceId !== 'gdrive_oauth') {
     try {
       const parsed = await engine.importAnnotationsFromSource(target.sourceId, doc.uri);
@@ -499,6 +513,17 @@ export async function fetchDocTextPreview(
       if (rawLines.length > 0) {
         const joined = rawLines.join('\n').trim();
         if (joined) {
+          readmeTextCache.set(cacheKey, joined);
+          return joined;
+        }
+      }
+      if (parsed.annotations && parsed.annotations.length > 0) {
+        const sampleLines = parsed.annotations
+          .slice(0, 20)
+          .map((a) => [a.soundfile, a.comment, a.notes].filter(Boolean).join(' '))
+          .filter(Boolean);
+        if (sampleLines.length > 0) {
+          const joined = sampleLines.join('\n').trim();
           readmeTextCache.set(cacheKey, joined);
           return joined;
         }
@@ -571,15 +596,20 @@ export async function discoverArchiveDocumentation(
   }
 
   // Also scan source root when connected on engine (non-upload, non-http, non-gdrive_oauth)
+  // Skip if currentEntries already loaded the exact same root prefix.
+  const rootPfx = target.rootPath ?? target.connectReq?.prefix ?? '';
+  const alreadyHaveRootEntries =
+    Boolean(target.currentEntries && target.currentEntries.length > 0) &&
+    (target.currentPrefix ?? '') === rootPfx;
   if (
+    !alreadyHaveRootEntries &&
     target.sourceId &&
     target.sourceId !== 'http' &&
     target.sourceId !== 'gdrive_oauth' &&
     target.sourceId !== 'upload'
   ) {
-    const rootPfx = target.rootPath ?? target.connectReq?.prefix ?? '';
     try {
-      const rootEntries = await engine.browseSource(target.sourceId, rootPfx, 200);
+      const rootEntries = await engine.browseSource(target.sourceId, rootPfx, 1000);
       for (const entry of rootEntries) {
         if (!entry.isDir && isDocumentationEntryName(entry.name)) {
           pushDoc(
@@ -623,16 +653,25 @@ export async function discoverArchiveDocumentation(
 
   let primaryReadmeText: string | undefined;
   let primaryReadmeName: string | undefined;
-  const textCandidate =
-    (target.focusDocUri
-      ? discovered.find((d) => d.uri === target.focusDocUri && d.kind !== 'pdf')
-      : undefined) ?? discovered.find((d) => d.kind === 'text');
+  const textCandidates = discovered.filter((d) => d.kind !== 'pdf');
+  const focused = target.focusDocUri
+    ? textCandidates.find((d) => d.uri === target.focusDocUri)
+    : undefined;
+  const orderedCandidates = focused
+    ? [focused, ...textCandidates.filter((d) => d.uri !== focused.uri)]
+    : textCandidates;
 
-  if (textCandidate && options?.readText) {
-    const txt = await fetchDocTextPreview(engine, target, textCandidate);
-    if (txt) {
-      primaryReadmeText = txt;
-      primaryReadmeName = textCandidate.name;
+  if (orderedCandidates.length > 0 && options?.readText) {
+    const chunks: string[] = [];
+    for (const cand of orderedCandidates.slice(0, 3)) {
+      const txt = await fetchDocTextPreview(engine, target, cand);
+      if (txt) {
+        if (!primaryReadmeName) primaryReadmeName = cand.name;
+        chunks.push(cand.name === primaryReadmeName ? txt : `--- ${cand.name} ---\n${txt}`);
+      }
+    }
+    if (chunks.length > 0) {
+      primaryReadmeText = chunks.join('\n\n').slice(0, 32_000);
     }
   }
 
@@ -656,6 +695,50 @@ export async function discoverArchiveDocumentation(
 
   discoveryCache.set(cacheKey, result);
   return result;
+}
+
+export async function collectSubfolderResearchText(
+  engine: AudioEngineClient,
+  target: ArchiveTargetInput,
+  docEntries: Array<{
+    sourceId: string;
+    uri: string;
+    name: string;
+    dirParts: string[];
+    sizeBytes?: number;
+  }>,
+): Promise<string> {
+  if (!docEntries || docEntries.length === 0) return '';
+  const prioritized = [...docEntries].sort((a, b) => {
+    const score = (n: string): number => {
+      if (/^readme/i.test(n)) return 0;
+      if (/\.(md|markdown|txt|rst)$/i.test(n)) return 1;
+      if (/^(aru|coord|receiver|channel|metadata|deploy)/i.test(n)) return 2;
+      return 3;
+    };
+    const diff = score(a.name) - score(b.name);
+    return diff !== 0 ? diff : a.name.localeCompare(b.name);
+  });
+
+  const chunks: string[] = [];
+  for (const item of prioritized.slice(0, 4)) {
+    if (item.sizeBytes && item.sizeBytes > 2 * 1024 * 1024) continue;
+    const isDrive = target.kind === 'gdrive' || target.sourceId === 'gdrive_oauth';
+    const doc = toDiscoveredDoc(
+      item.name,
+      item.uri,
+      item.sizeBytes,
+      target,
+      isDrive ? item.uri : undefined,
+      item.dirParts.join('/'),
+    );
+    const txt = await fetchDocTextPreview(engine, target, doc);
+    if (txt) {
+      const clipped = txt.split(/\r?\n/).slice(0, 45).join('\n');
+      chunks.push(`[${item.dirParts.length > 0 ? `${item.dirParts.join('/')}/` : ''}${item.name}]\n${clipped}`);
+    }
+  }
+  return chunks.join('\n\n').slice(0, 16_000);
 }
 
 export function DataSourceToArchiveTarget(

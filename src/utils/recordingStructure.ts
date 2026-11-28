@@ -1,6 +1,10 @@
 import type { AudioEngineClient, BrowseEntry } from '@syrinxone/shared';
 import { listDriveItems, type DriveItem } from '../auth/googleDrive';
 import {
+  isDocumentationEntryName,
+  isStructuredMetadataEntryName,
+} from './archiveDocs';
+import {
   makeCombinedRecordingKey,
   makeSingleRecordingKey,
   naturalCompareNames,
@@ -18,8 +22,17 @@ export interface ScannedAudioFile {
   sizeBytes?: number;
 }
 
+export interface ScannedDocEntry {
+  sourceId: string;
+  uri: string;
+  name: string;
+  dirParts: string[];
+  sizeBytes?: number;
+}
+
 export interface StructureScanResult {
   files: ScannedAudioFile[];
+  docEntries: ScannedDocEntry[];
   scannedFolders: number;
   truncated: boolean;
   rootPrefix: string;
@@ -119,6 +132,9 @@ export interface StructureAnalysisResult {
   detectedChannelFieldId: string | null;
   hasDates: boolean;
   hasTimes: boolean;
+  hasDiscreteTimeFolders: boolean;
+  allowTimeSlices: boolean;
+  timeSliceNote: string;
   docInsights: string[];
   suggestions: RecordingStructureSuggestion[];
 }
@@ -133,8 +149,30 @@ interface ParsedFileMetadata {
   nonChannelStem: string;
 }
 
+interface DocResearchSignals {
+  mentionsTimeAligned: boolean;
+  mentionsPerFileChannel: boolean;
+  mentionsLongCadence: boolean;
+  mentionedChannelCount: number | null;
+}
+
 const CHANNEL_TOKEN_RE = /^(?:ch|chan|channel|mic|hydrophone|trk|track)[-_]?0*(\d+)$/i;
+const ARRAY_UNIT_TOKEN_RE = /^(?:r|rec|receiver|aru|node|sensor|unit|station)[-_]?0*(\d+)$/i;
 const STORAGE_KEY = 'syrinxone.recordingDefinitions.v1';
+
+export function isDiscreteTimeFolderName(seg: string): boolean {
+  const s = (seg || '').trim();
+  if (!s) return false;
+  if (/^(19\d{2}|20\d{2})$/.test(s)) return true;
+  if (/^(19\d{2}|20\d{2})[-_](0[1-9]|1[0-2])$/.test(s)) return true;
+  if (/^(19\d{2}|20\d{2})[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12]\d|3[01])$/.test(s)) return true;
+  if (/^(?:hour|hr|day|wk|week|month|mo|yr|year)[-_]?\d{1,4}$/i.test(s)) return true;
+  if (/^(?:hourly|daily|weekly|monthly|yearly)$/i.test(s)) return true;
+  if (/^(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)(?:uary|ruary|ch|il|e|y|ust|tember|ober|ember)?$/i.test(s)) {
+    return true;
+  }
+  return false;
+}
 
 function isValidYmd(y: number, m: number, d: number): boolean {
   if (m < 1 || m > 12 || d < 1 || d > 31) return false;
@@ -163,12 +201,24 @@ function tryParseEightDigitYyyyMmDd(token: string): { y: number; m: number; d: n
   return { y, m: mo, d };
 }
 
-function parseChannelToken(token: string): { label: string; sortNum: number } | null {
+function parseChannelToken(
+  token: string,
+  allowArrayUnit = false,
+): { label: string; sortNum: number; confidence: 'explicit' | 'array' } | null {
   const m = token.match(CHANNEL_TOKEN_RE);
   if (m) {
     const num = Number(m[1]);
     if (Number.isFinite(num) && num >= 0 && num <= 256) {
-      return { label: token.toUpperCase(), sortNum: num };
+      return { label: token.toUpperCase(), sortNum: num, confidence: 'explicit' };
+    }
+  }
+  if (allowArrayUnit) {
+    const am = token.match(ARRAY_UNIT_TOKEN_RE);
+    if (am) {
+      const num = Number(am[1]);
+      if (Number.isFinite(num) && num >= 0 && num <= 256) {
+        return { label: token.toUpperCase(), sortNum: num, confidence: 'array' };
+      }
     }
   }
   return null;
@@ -185,19 +235,66 @@ function tokenizeStem(filename: string): string[] {
 function extractChannelFromFile(
   tokens: string[],
   dirParts: string[],
-): { fieldId: string; label: string; sortNum: number; tokenIndex?: number; dirIndex?: number } | null {
-  // Prefer rightmost channel token in filename (e.g., BGD_150203_010_CAF.CH1.wav)
+  allowArrayUnit = false,
+): {
+  fieldId: string;
+  label: string;
+  sortNum: number;
+  confidence: 'explicit' | 'array';
+  tokenIndex?: number;
+  dirIndex?: number;
+} | null {
+  // Pass 1: Prefer explicit channel tokens (rightmost first, e.g., BGD_150203_010_CAF.CH1.wav)
   for (let i = tokens.length - 1; i >= 0; i--) {
-    const ch = parseChannelToken(tokens[i]);
+    const ch = parseChannelToken(tokens[i], false);
     if (ch) {
-      return { fieldId: `tok:${i}`, label: ch.label, sortNum: ch.sortNum, tokenIndex: i };
+      return {
+        fieldId: `tok:${i}`,
+        label: ch.label,
+        sortNum: ch.sortNum,
+        confidence: ch.confidence,
+        tokenIndex: i,
+      };
     }
   }
-  // Fallback: channel folder (e.g., ch1/20230101.wav)
   for (let i = dirParts.length - 1; i >= 0; i--) {
-    const ch = parseChannelToken(dirParts[i]);
+    const ch = parseChannelToken(dirParts[i], false);
     if (ch) {
-      return { fieldId: `dir:${i}`, label: ch.label, sortNum: ch.sortNum, dirIndex: i };
+      return {
+        fieldId: `dir:${i}`,
+        label: ch.label,
+        sortNum: ch.sortNum,
+        confidence: ch.confidence,
+        dirIndex: i,
+      };
+    }
+  }
+
+  // Pass 2: Array receiver / node tokens (e.g., R1..R9, ARU1..ARU4, Node1..Node4)
+  if (allowArrayUnit) {
+    for (let i = 0; i < tokens.length; i++) {
+      const ch = parseChannelToken(tokens[i], true);
+      if (ch) {
+        return {
+          fieldId: `tok:${i}`,
+          label: ch.label,
+          sortNum: ch.sortNum,
+          confidence: ch.confidence,
+          tokenIndex: i,
+        };
+      }
+    }
+    for (let i = dirParts.length - 1; i >= 0; i--) {
+      const ch = parseChannelToken(dirParts[i], true);
+      if (ch) {
+        return {
+          fieldId: `dir:${i}`,
+          label: ch.label,
+          sortNum: ch.sortNum,
+          confidence: ch.confidence,
+          dirIndex: i,
+        };
+      }
     }
   }
   return null;
@@ -261,21 +358,70 @@ function formatUtcDateParts(ms: number): {
   };
 }
 
+function analyzeDocSignals(docText: string): DocResearchSignals {
+  const clean = (docText || '').trim();
+  if (!clean) {
+    return {
+      mentionsTimeAligned: false,
+      mentionsPerFileChannel: false,
+      mentionsLongCadence: false,
+      mentionedChannelCount: null,
+    };
+  }
+  const chMatch = clean.match(
+    /(\b\d{1,2})\s*[-]?\s*(?:channel|ch\b|mic(?:rophone)?s?|hydrophones?|receivers?|arus?)\b/i,
+  );
+  const rangeMatch = clean.match(/\b([Rr]|CH|ARU)[-_]?0*1\s*[-–—to]+\s*\1[-_]?0*(\d{1,2})\b/);
+  const mentionedChannelCount = chMatch
+    ? Number(chMatch[1])
+    : rangeMatch
+      ? Number(rangeMatch[2])
+      : null;
+
+  const mentionsTimeAligned =
+    /\b(?:time[- ]?aligned|time[- ]?sync(?:hronized)?|synchronized|simultaneous|concurrent|tdoa|acoustic localization|localization array|synchronizedrecorderarray)\b/i.test(
+      clean,
+    );
+  const mentionsPerFileChannel =
+    /\b(?:each file|one (?:audio )?file per|1 from each receiver|separate (?:file|wav)s? for each|each receiver|per[- ]channel files?|aru[_ ]?coords)\b/i.test(
+      clean,
+    ) || Boolean(rangeMatch);
+  const mentionsLongCadence =
+    /\b(?:continuous monitoring|24\/7|duty[- ]cycle|24[- ]?hour|multi[- ]?day|daily wav|hourly wav|long[- ]?term archive)\b/i.test(
+      clean,
+    );
+
+  return {
+    mentionsTimeAligned,
+    mentionsPerFileChannel,
+    mentionsLongCadence,
+    mentionedChannelCount:
+      mentionedChannelCount !== null && Number.isFinite(mentionedChannelCount)
+        ? mentionedChannelCount
+        : null,
+  };
+}
+
 function extractDocumentationInsights(
   docText: string,
   categoricalValues: Set<string>,
+  signals: DocResearchSignals,
 ): { insights: string[]; codeGlossary: Record<string, string> } {
   const insights: string[] = [];
   const codeGlossary: Record<string, string> = {};
   const clean = (docText || '').trim();
   if (!clean) return { insights, codeGlossary };
 
-  // Detect channel / microphone array hints in documentation
-  const chMention = clean.match(
-    /(\b\d{1,2})\s*[-]?\s*(?:channel|ch\b|mic(?:rophone)?s?|hydrophones?)\b/i,
-  );
-  if (chMention) {
-    insights.push(`Docs mention ${chMention[0].trim()} recordings`);
+  if (signals.mentionsTimeAligned && signals.mentionsPerFileChannel) {
+    insights.push(
+      `Docs state recordings are time-aligned across ${signals.mentionedChannelCount ? `${signals.mentionedChannelCount} receivers/channels` : 'array receivers'} — each file maps to a parallel channel`,
+    );
+  } else if (signals.mentionsTimeAligned) {
+    insights.push(
+      `Docs describe a time-synchronized / localization array${signals.mentionedChannelCount ? ` (${signals.mentionedChannelCount} mics/receivers)` : ''}`,
+    );
+  } else if (signals.mentionedChannelCount) {
+    insights.push(`Docs reference ${signals.mentionedChannelCount}-channel / receiver recordings`);
   }
 
   // Detect cadence/organization keywords in docs
@@ -328,20 +474,27 @@ function extractDocumentationInsights(
   return { insights, codeGlossary };
 }
 
-function parseAllFiles(files: ScannedAudioFile[]): {
+function parseAllFiles(
+  files: ScannedAudioFile[],
+  docSignals?: DocResearchSignals,
+): {
   parsed: ParsedFileMetadata[];
   fields: DiscoveredField[];
   detectedChannelFieldId: string | null;
+  perChannelFieldIds: Set<string>;
   hasDates: boolean;
   hasTimes: boolean;
+  hasDiscreteTimeFolders: boolean;
 } {
   if (files.length === 0) {
     return {
       parsed: [],
       fields: [],
       detectedChannelFieldId: null,
+      perChannelFieldIds: new Set<string>(),
       hasDates: false,
       hasTimes: false,
+      hasDiscreteTimeFolders: false,
     };
   }
 
@@ -370,14 +523,22 @@ function parseAllFiles(files: ScannedAudioFile[]): {
     }
   }
 
-  // Detect channel field across files
-  const channelHits = new Map<string, { files: number; distinctLabels: Set<string> }>();
+  // Detect channel field across files (first explicit CH/MIC/HYDROPHONE, plus array receiver tokens R1..R9)
+  const channelHits = new Map<
+    string,
+    { files: number; distinctLabels: Set<string>; confidence: 'explicit' | 'array' }
+  >();
   const rawChannels = tokenized.map((item) => {
-    const ch = extractChannelFromFile(item.tokens, item.dirParts);
+    const ch = extractChannelFromFile(item.tokens, item.dirParts, true);
     if (ch) {
-      const rec = channelHits.get(ch.fieldId) ?? { files: 0, distinctLabels: new Set<string>() };
+      const rec = channelHits.get(ch.fieldId) ?? {
+        files: 0,
+        distinctLabels: new Set<string>(),
+        confidence: ch.confidence,
+      };
       rec.files++;
       rec.distinctLabels.add(ch.label);
+      if (ch.confidence === 'explicit') rec.confidence = 'explicit';
       channelHits.set(ch.fieldId, rec);
     }
     return ch;
@@ -385,26 +546,42 @@ function parseAllFiles(files: ScannedAudioFile[]): {
 
   // Also check if a channel token exists across variable positions (use virtual field 'channel:auto')
   let detectedChannelFieldId: string | null = null;
+  let detectedConfidence: 'explicit' | 'array' = 'explicit';
   let bestChannelScore = 0;
   for (const [fid, stats] of channelHits.entries()) {
-    if (stats.distinctLabels.size >= 2 && stats.files >= 2 && stats.files > bestChannelScore) {
-      bestChannelScore = stats.files;
-      detectedChannelFieldId = fid;
+    if (stats.distinctLabels.size >= 2 && stats.files >= 2) {
+      const weightedScore = stats.files + (stats.confidence === 'explicit' ? 1000 : 0);
+      if (weightedScore > bestChannelScore) {
+        bestChannelScore = weightedScore;
+        detectedChannelFieldId = fid;
+        detectedConfidence = stats.confidence;
+      }
     }
   }
   const totalWithAnyChannel = rawChannels.filter(Boolean).length;
   const allDistinctChannels = new Set(rawChannels.filter(Boolean).map((c) => c!.label));
   if (!detectedChannelFieldId && allDistinctChannels.size >= 2 && totalWithAnyChannel >= 2) {
     detectedChannelFieldId = 'channel:auto';
+    detectedConfidence = rawChannels.some((c) => c?.confidence === 'explicit') ? 'explicit' : 'array';
   }
 
   // Parse each file into values + timestamp + nonChannelStem
   let hasDates = false;
   let hasTimes = false;
+  const discreteTimeFolderVals = new Set<string>();
   const parsed: ParsedFileMetadata[] = tokenized.map((item, idx) => {
     const values: Record<string, string> = {};
+    let parentWasTime = false;
     for (let d = 0; d < item.dirParts.length; d++) {
-      values[`dir:${d}`] = item.dirParts[d];
+      const seg = item.dirParts[d];
+      values[`dir:${d}`] = seg;
+      const isSegTime: boolean =
+        isDiscreteTimeFolderName(seg) ||
+        (parentWasTime && /^(0?[1-9]|[12]\d|3[01])$/.test(seg));
+      if (isSegTime) {
+        discreteTimeFolderVals.add(`${d}:${seg}`);
+      }
+      parentWasTime = isSegTime;
     }
     for (let t = 0; t < item.tokens.length; t++) {
       values[`tok:${t}`] = item.tokens[t];
@@ -477,18 +654,63 @@ function parseAllFiles(files: ScannedAudioFile[]): {
     };
   });
 
-  // Verify channel grouping actually pairs >= 2 channels for at least one stem
+  const hasDiscreteTimeFolders = discreteTimeFolderVals.size >= 2;
+
+  // Validate channel grouping:
+  // 1) Matched nonChannelStem pairs >= 2 channels (e.g. CHiME-3 CH1..CH6)
+  // 2) OR synchronized/time-aligned array where receiver tokens (R1..R9) span files with per-device IDs/offsets
   if (detectedChannelFieldId) {
     const stemChannels = new Map<string, Set<string>>();
+    const channelCounts = new Map<string, number>();
     for (const p of parsed) {
       if (!p.channelLabel) continue;
       const set = stemChannels.get(p.nonChannelStem) ?? new Set<string>();
       set.add(p.channelLabel);
       stemChannels.set(p.nonChannelStem, set);
+      channelCounts.set(p.channelLabel, (channelCounts.get(p.channelLabel) ?? 0) + 1);
     }
     const hasPairedMultiCh = Array.from(stemChannels.values()).some((s) => s.size >= 2);
-    if (!hasPairedMultiCh) {
+    const coverage = totalWithAnyChannel / Math.max(1, parsed.length);
+    const docsSupportArray = Boolean(
+      docSignals?.mentionsTimeAligned || docSignals?.mentionsPerFileChannel,
+    );
+    const looksLikeSynchronizedArray =
+      allDistinctChannels.size >= 2 &&
+      coverage >= 0.75 &&
+      (docsSupportArray ||
+        detectedConfidence === 'explicit' ||
+        Array.from(channelCounts.values()).every((cnt) => cnt === 1));
+
+    if (!hasPairedMultiCh && !looksLikeSynchronizedArray) {
       detectedChannelFieldId = null;
+    }
+  }
+
+  // Detect fields whose values are 1-to-1 with individual channels (e.g., per-receiver serial numbers or clock offsets)
+  const perChannelFieldIds = new Set<string>();
+  if (detectedChannelFieldId) {
+    const checkIds: string[] = [];
+    for (let d = 0; d < maxDirLen; d++) checkIds.push(`dir:${d}`);
+    for (let t = 0; t < maxTokLen; t++) checkIds.push(`tok:${t}`);
+    for (const fid of checkIds) {
+      if (fid === detectedChannelFieldId) continue;
+      const valToChannels = new Map<string, Set<string>>();
+      let rowsWithBoth = 0;
+      for (const p of parsed) {
+        const v = p.values[fid];
+        const ch = p.values[detectedChannelFieldId] ?? p.channelLabel;
+        if (!v || !ch) continue;
+        rowsWithBoth++;
+        const chSet = valToChannels.get(v) ?? new Set<string>();
+        chSet.add(ch);
+        valToChannels.set(v, chSet);
+      }
+      if (rowsWithBoth >= 2 && valToChannels.size >= 2) {
+        const singleChannelVals = Array.from(valToChannels.values()).filter((s) => s.size === 1).length;
+        if (singleChannelVals / valToChannels.size >= 0.85) {
+          perChannelFieldIds.add(fid);
+        }
+      }
     }
   }
 
@@ -573,7 +795,7 @@ function parseAllFiles(files: ScannedAudioFile[]): {
         label: `Channel (${vals[0]}–${vals[vals.length - 1]})`,
         role: 'channel',
         source: 'filename',
-        sampleValues: vals.slice(0, 8),
+        sampleValues: vals.slice(0, 16),
         uniqueCount: vals.length,
       });
       continue;
@@ -636,12 +858,20 @@ function parseAllFiles(files: ScannedAudioFile[]): {
       label: `Channel (${vals[0]}–${vals[vals.length - 1]})`,
       role: 'channel',
       source: 'filename',
-      sampleValues: vals.slice(0, 8),
+      sampleValues: vals.slice(0, 16),
       uniqueCount: vals.length,
     });
   }
 
-  return { parsed, fields, detectedChannelFieldId, hasDates, hasTimes };
+  return {
+    parsed,
+    fields,
+    detectedChannelFieldId,
+    perChannelFieldIds,
+    hasDates,
+    hasTimes,
+    hasDiscreteTimeFolders,
+  };
 }
 
 function buildRecordingTitle(
@@ -649,6 +879,7 @@ function buildRecordingTitle(
   groupByFieldIds: string[],
   items: ParsedFileMetadata[],
   fallbackLabel: string,
+  channelLabels: string[] = [],
 ): string {
   const parts: string[] = [];
   for (const fid of groupByFieldIds) {
@@ -660,6 +891,10 @@ function buildRecordingTitle(
   }
   if (items.length === 1) {
     return items[0].file.name;
+  }
+  if (channelLabels.length >= 2) {
+    const chRange = `${channelLabels[0]}–${channelLabels[channelLabels.length - 1]}`;
+    return fallbackLabel.includes(chRange) ? fallbackLabel : `${fallbackLabel} (${chRange})`;
   }
   return fallbackLabel;
 }
@@ -704,7 +939,10 @@ export function buildDefinedRecordings(
         channelCount: 1,
         channelLabels: [],
         totalSizeBytes: p.file.sizeBytes ?? 0,
-        startDateTimeIso: p.timestampMs !== null ? new Date(p.timestampMs).toISOString() : null,
+        startDateTimeIso:
+          p.timestampMs !== null && Number.isFinite(p.timestampMs)
+            ? new Date(p.timestampMs).toISOString()
+            : null,
         dateSpanLabel: p.values['date:day'],
         specs: [spec],
         groupValues: {},
@@ -718,14 +956,28 @@ export function buildDefinedRecordings(
     (definition.combineMode === 'channels' || definition.combineMode === 'channels_and_time') &&
     Boolean(definition.channelFieldId);
 
+  let stemHasMultiChPairs = false;
+  if (definition.combineMode === 'channels' && definition.groupByFieldIds.length === 0) {
+    const stemCounts = new Map<string, number>();
+    for (const p of parsed) {
+      stemCounts.set(p.nonChannelStem, (stemCounts.get(p.nonChannelStem) ?? 0) + 1);
+    }
+    stemHasMultiChPairs = Array.from(stemCounts.values()).some((c) => c >= 2);
+  }
+
   for (const p of parsed) {
     const gv: Record<string, string> = {};
     let keyParts: string[];
 
     if (definition.combineMode === 'channels' && definition.groupByFieldIds.length === 0) {
-      // Default channel grouping pairs files with identical non-channel stem
-      keyParts = [p.nonChannelStem];
-      gv['stem'] = p.nonChannelStem.split('::').pop()?.replace(/_/g, ' ') || p.file.name;
+      if (stemHasMultiChPairs) {
+        // Pair files sharing identical non-channel stem (e.g., CHiME-3 CH1..CH6 per utterance)
+        keyParts = [p.nonChannelStem];
+        gv['stem'] = p.nonChannelStem.split('::').pop()?.replace(/_/g, ' ') || p.file.name;
+      } else {
+        // Synchronized array whose per-receiver stems differ (e.g., R1..R9 with device serials/clock offsets)
+        keyParts = [];
+      }
     } else {
       keyParts = definition.groupByFieldIds.map((fid) => {
         const val = p.values[fid] ?? '';
@@ -760,16 +1012,50 @@ export function buildDefinedRecordings(
     let channelLabels: string[] = [];
 
     if (useChannelStacking) {
-      // Sub-group items within this recording by nonChannelStem (each time slice has 1..K parallel channel files)
-      const sliceMap = new Map<string, ParsedFileMetadata[]>();
+      const chFieldId = definition.channelFieldId!;
+      // 1. Try pairing items by shared nonChannelStem (e.g., CHiME-3 F01_...CH1..CH6)
+      const stemSliceMap = new Map<string, ParsedFileMetadata[]>();
       for (const item of items) {
-        const list = sliceMap.get(item.nonChannelStem) ?? [];
+        const list = stemSliceMap.get(item.nonChannelStem) ?? [];
         list.push(item);
-        sliceMap.set(item.nonChannelStem, list);
+        stemSliceMap.set(item.nonChannelStem, list);
       }
 
-      const slices = Array.from(sliceMap.values()).map((chItems) => {
-        const chFieldId = definition.channelFieldId!;
+      const stemPairsMultiple = Array.from(stemSliceMap.values()).some((list) => list.length >= 2);
+      let sliceGroups: ParsedFileMetadata[][];
+
+      if (stemPairsMultiple) {
+        sliceGroups = Array.from(stemSliceMap.values());
+      } else {
+        // 2. Fallback for synchronized/time-aligned arrays (e.g., R1..R9 with distinct logger IDs/clock offsets):
+        // group by channel label, sort each channel's segments, and zip slice-by-slice across channels
+        const byChannel = new Map<string, ParsedFileMetadata[]>();
+        for (const item of items) {
+          const chKey = item.values[chFieldId] ?? item.channelLabel ?? item.file.name;
+          const list = byChannel.get(chKey) ?? [];
+          list.push(item);
+          byChannel.set(chKey, list);
+        }
+        for (const list of byChannel.values()) {
+          list.sort((a, b) => {
+            if (definition.sortBy === 'timestamp' && a.timestampMs !== null && b.timestampMs !== null) {
+              if (a.timestampMs !== b.timestampMs) return a.timestampMs - b.timestampMs;
+            }
+            return naturalCompareNames(a.file.name, b.file.name);
+          });
+        }
+        const maxSlices = Math.max(1, ...Array.from(byChannel.values()).map((l) => l.length));
+        sliceGroups = [];
+        for (let i = 0; i < maxSlices; i++) {
+          const parallel: ParsedFileMetadata[] = [];
+          for (const list of byChannel.values()) {
+            if (list[i]) parallel.push(list[i]);
+          }
+          if (parallel.length > 0) sliceGroups.push(parallel);
+        }
+      }
+
+      const slices = sliceGroups.map((chItems) => {
         const sortedCh = [...chItems].sort((a, b) => {
           if (a.channelSortNum !== b.channelSortNum) return a.channelSortNum - b.channelSortNum;
           const va = a.values[chFieldId] ?? a.file.name;
@@ -795,7 +1081,7 @@ export function buildDefinedRecordings(
       const distinctChLabels = new Map<number, string>();
       specs = slices.map(({ first, sortedCh }) => {
         const chSpecs: SegmentSourceSpec[] = sortedCh.map((c, idx) => {
-          const chLbl = c.values[definition.channelFieldId!] ?? c.channelLabel ?? `CH${idx + 1}`;
+          const chLbl = c.values[chFieldId] ?? c.channelLabel ?? `CH${idx + 1}`;
           if (!distinctChLabels.has(idx)) distinctChLabels.set(idx, chLbl);
           return {
             sourceId: c.file.sourceId,
@@ -833,7 +1119,7 @@ export function buildDefinedRecordings(
     const totalSizeBytes = items.reduce((acc, p) => acc + (p.file.sizeBytes ?? 0), 0);
     const validTs = items
       .map((p) => p.timestampMs)
-      .filter((ms): ms is number => ms !== null)
+      .filter((ms): ms is number => ms !== null && Number.isFinite(ms))
       .sort((a, b) => a - b);
     const startDateTimeIso = validTs.length > 0 ? new Date(validTs[0]).toISOString() : null;
     let dateSpanLabel: string | undefined;
@@ -848,6 +1134,7 @@ export function buildDefinedRecordings(
       definition.groupByFieldIds.length > 0 ? definition.groupByFieldIds : Object.keys(groupValues),
       items,
       definition.label || 'Combined Recording',
+      channelLabels,
     );
 
     const subParts: string[] = [];
@@ -914,7 +1201,16 @@ export function analyzeRecordingStructure(
     includeSubfolders?: boolean;
   },
 ): StructureAnalysisResult {
-  const { fields, detectedChannelFieldId, hasDates, hasTimes } = parseAllFiles(files);
+  const docSignals = analyzeDocSignals(options?.docText ?? '');
+  const {
+    parsed,
+    fields,
+    detectedChannelFieldId,
+    perChannelFieldIds,
+    hasDates,
+    hasTimes,
+    hasDiscreteTimeFolders,
+  } = parseAllFiles(files, docSignals);
 
   // Collect categorical values to cross-reference against README / documentation
   const catValues = new Set<string>();
@@ -926,6 +1222,7 @@ export function analyzeRecordingStructure(
   const { insights: docInsights, codeGlossary } = extractDocumentationInsights(
     options?.docText ?? '',
     catValues,
+    docSignals,
   );
 
   // Attach README glosses onto matching fields
@@ -939,14 +1236,57 @@ export function analyzeRecordingStructure(
     }
   }
 
-  const categoryFields = fields.filter((f) => f.role === 'category');
-  const folderFields = fields.filter((f) => f.role === 'folder');
-  const sessionFields = fields.filter((f) => f.role === 'session');
+  // Filter out per-channel hardware serials / clock-offset tokens from recording-splitting fields
+  const categoryFields = fields.filter(
+    (f) => f.role === 'category' && !perChannelFieldIds.has(f.id),
+  );
+  const folderFields = fields.filter(
+    (f) => f.role === 'folder' && !perChannelFieldIds.has(f.id),
+  );
+  const sessionFields = fields.filter(
+    (f) => f.role === 'session' && !perChannelFieldIds.has(f.id),
+  );
   const hasChannelField = Boolean(detectedChannelFieldId);
   const baseCombineMode: CombineStructureMode = hasChannelField ? 'channels_and_time' : 'time';
   const rootPrefix = options?.rootPrefix ?? '';
   const includeSubfolders = options?.includeSubfolders ?? true;
   const now = Date.now();
+
+  // Evaluate whether time-increment slicing / grouping (hour, day, month, year) is applicable:
+  // ONLY offer time slices when the recording will be long OR files live in discrete time folders.
+  const chField = hasChannelField
+    ? fields.find((f) => f.id === detectedChannelFieldId)
+    : undefined;
+  const estChannels = Math.max(1, chField?.uniqueCount ?? 1);
+  const totalSizeBytes = files.reduce((acc, f) => acc + (f.sizeBytes ?? 0), 0);
+  const maxSingleFileBytes = files.reduce((m, f) => Math.max(m, f.sizeBytes ?? 0), 0);
+  const perTimelineBytes = totalSizeBytes / estChannels;
+
+  const dayCount = fields.find((f) => f.id === 'date:day')?.uniqueCount ?? 0;
+  const monthCount = fields.find((f) => f.id === 'date:month')?.uniqueCount ?? 0;
+  const yearCount = fields.find((f) => f.id === 'date:year')?.uniqueCount ?? 0;
+  const hourCount = fields.find((f) => f.id === 'date:hour')?.uniqueCount ?? 0;
+  const isSingleSynchronizedArray =
+    hasChannelField &&
+    estChannels >= 2 &&
+    files.length <= estChannels &&
+    !hasDiscreteTimeFolders;
+
+  const isLongArchive =
+    maxSingleFileBytes > 20 * 1024 * 1024 ||
+    perTimelineBytes > 60 * 1024 * 1024 ||
+    dayCount >= 2 ||
+    (!docSignals.mentionsTimeAligned && !isSingleSynchronizedArray && hourCount >= 2) ||
+    (docSignals.mentionsLongCadence && Math.ceil(files.length / estChannels) >= 2);
+
+  const allowTimeSlices = hasDiscreteTimeFolders || isLongArchive;
+  const timeSliceNote = allowTimeSlices
+    ? hasDiscreteTimeFolders
+      ? 'Discrete time-increment folders detected — hour/day/month/year grouping available.'
+      : 'Long or multi-period recording detected — time-increment grouping available.'
+    : files.length > 0
+      ? 'Short recording without discrete time-increment folders — time slices omitted.'
+      : '';
 
   const rawSuggestions: Array<{
     id: string;
@@ -959,25 +1299,31 @@ export function analyzeRecordingStructure(
   }> = [];
 
   const nonChannelIdentityIds = [
-    ...(hasDates ? ['date:day'] : []),
+    ...(allowTimeSlices && dayCount >= 2 ? ['date:day'] : []),
     ...folderFields.map((f) => f.id),
     ...categoryFields.map((f) => f.id),
     ...sessionFields.map((f) => f.id),
   ];
 
-  // 1. Multi-channel per-session / per-stem combining (e.g., CHiME-3 CH1..CH6 -> 1 recording per session)
+  // 1. Multi-channel per-session / synchronized-array combining
+  //    (e.g., OpenSoundscape R1..R9 -> 1 9-channel recording; CHiME-3 CH1..CH6 -> 1 recording per session)
   if (hasChannelField && detectedChannelFieldId) {
-    const chField = fields.find((f) => f.id === detectedChannelFieldId);
     const chRangeText =
       chField && chField.sampleValues.length >= 2
         ? `${chField.sampleValues[0]}–${chField.sampleValues[chField.sampleValues.length - 1]}`
         : 'multi-channel';
+    const isSyncArray =
+      docSignals.mentionsTimeAligned ||
+      docSignals.mentionsPerFileChannel ||
+      (nonChannelIdentityIds.length === 0 && estChannels >= 2);
     const def: RecordingStructureDefinition = {
       id: 'channel_group',
-      label: `Combined Channels per Session (${chRangeText})`,
+      label: isSyncArray
+        ? `Synchronized ${estChannels}-Channel Array`
+        : `Combined Channels per Session (${chRangeText})`,
       granularity: 'channel_group',
       combineMode: 'channels',
-      groupByFieldIds: nonChannelIdentityIds,
+      groupByFieldIds: isSyncArray && dayCount <= 1 ? [] : nonChannelIdentityIds,
       channelFieldId: detectedChannelFieldId,
       sortBy: hasDates ? 'timestamp' : 'name',
       rootPrefix,
@@ -986,11 +1332,17 @@ export function analyzeRecordingStructure(
     };
     rawSuggestions.push({
       id: 'channel_group',
-      title: `Combine Channels per Recording (${chRangeText})`,
-      description: `Stacks synchronized ${chRangeText} files into a single multi-channel recording for each session.`,
+      title: isSyncArray
+        ? `Stack Synchronized Array Channels (${chRangeText})`
+        : `Combine Channels per Recording (${chRangeText})`,
+      description: isSyncArray
+        ? `Combines time-aligned ${chRangeText} files into a single ${estChannels}-channel recording.`
+        : `Stacks synchronized ${chRangeText} files into a single multi-channel recording for each session.`,
       granularity: 'channel_group',
       recommended: true,
-      rationale: `Detected ${chField?.uniqueCount ?? 'multiple'} paired channel tracks (${chRangeText}) sharing identical recording stems.`,
+      rationale: docSignals.mentionsTimeAligned
+        ? `Documentation confirms files are time-aligned across ${chField?.uniqueCount ?? estChannels} receivers (${chRangeText}).`
+        : `Detected ${chField?.uniqueCount ?? 'multiple'} paired channel/receiver tracks (${chRangeText}).`,
       definition: def,
     });
   }
@@ -1000,95 +1352,101 @@ export function analyzeRecordingStructure(
     ...categoryFields.slice(0, 1).map((f) => f.id),
   ];
 
-  // 2. Time granularities: Hour -> Day -> Month -> Year
-  if (hasTimes) {
-    rawSuggestions.push({
-      id: 'by_hour',
-      title: hasChannelField ? 'Separate by Hour (Multi-Channel)' : 'Separate by Hour',
-      description: 'Combines all files within each hour into one continuous recording.',
-      granularity: 'hour',
-      recommended: false,
-      definition: {
+  // 2. Time granularities: ONLY offer when recording is long OR stored in discrete time folders
+  if (allowTimeSlices) {
+    if (hasTimes && (hourCount >= 2 || hasDiscreteTimeFolders)) {
+      rawSuggestions.push({
         id: 'by_hour',
-        label: hasChannelField ? 'By Hour (Multi-Channel)' : 'By Hour',
+        title: hasChannelField ? 'Separate by Hour (Multi-Channel)' : 'Separate by Hour',
+        description: 'Combines all files within each hour into one continuous recording.',
         granularity: 'hour',
-        combineMode: baseCombineMode,
-        groupByFieldIds: [...siteContextIds, 'date:hour'],
-        channelFieldId: detectedChannelFieldId,
-        sortBy: 'timestamp',
-        rootPrefix,
-        includeSubfolders,
-        updatedAt: now,
-      },
-    });
-  }
+        recommended: false,
+        definition: {
+          id: 'by_hour',
+          label: hasChannelField ? 'By Hour (Multi-Channel)' : 'By Hour',
+          granularity: 'hour',
+          combineMode: baseCombineMode,
+          groupByFieldIds: [...siteContextIds, 'date:hour'],
+          channelFieldId: detectedChannelFieldId,
+          sortBy: 'timestamp',
+          rootPrefix,
+          includeSubfolders,
+          updatedAt: now,
+        },
+      });
+    }
 
-  if (hasDates) {
-    rawSuggestions.push({
-      id: 'by_day',
-      title: hasChannelField ? 'Separate by Day (Multi-Channel)' : 'Separate by Day',
-      description:
-        siteContextIds.length > 0
-          ? 'Groups files by date and site/category into one continuous recording per day.'
-          : 'Combines all files recorded on the same calendar day into one recording.',
-      granularity: 'day',
-      recommended: !hasChannelField,
-      rationale: !hasChannelField
-        ? 'Timestamped files detected — daily recordings balance overview and quick navigation.'
-        : undefined,
-      definition: {
+    if (hasDates && (dayCount >= 2 || hasDiscreteTimeFolders || maxSingleFileBytes > 20 * 1024 * 1024)) {
+      rawSuggestions.push({
         id: 'by_day',
-        label: hasChannelField ? 'By Day (Multi-Channel)' : 'By Day',
+        title: hasChannelField ? 'Separate by Day (Multi-Channel)' : 'Separate by Day',
+        description:
+          siteContextIds.length > 0
+            ? 'Groups files by date and site/category into one continuous recording per day.'
+            : 'Combines all files recorded on the same calendar day into one recording.',
         granularity: 'day',
-        combineMode: baseCombineMode,
-        groupByFieldIds: [...siteContextIds, 'date:day'],
-        channelFieldId: detectedChannelFieldId,
-        sortBy: 'timestamp',
-        rootPrefix,
-        includeSubfolders,
-        updatedAt: now,
-      },
-    });
+        recommended: !hasChannelField,
+        rationale: !hasChannelField
+          ? 'Long or time-organized recordings detected — daily groups balance overview and navigation.'
+          : undefined,
+        definition: {
+          id: 'by_day',
+          label: hasChannelField ? 'By Day (Multi-Channel)' : 'By Day',
+          granularity: 'day',
+          combineMode: baseCombineMode,
+          groupByFieldIds: [...siteContextIds, 'date:day'],
+          channelFieldId: detectedChannelFieldId,
+          sortBy: 'timestamp',
+          rootPrefix,
+          includeSubfolders,
+          updatedAt: now,
+        },
+      });
+    }
 
-    rawSuggestions.push({
-      id: 'by_month',
-      title: hasChannelField ? 'Separate by Month (Multi-Channel)' : 'Separate by Month',
-      description: 'Combines all recordings within each calendar month into one long timeline.',
-      granularity: 'month',
-      recommended: false,
-      definition: {
+    if (hasDates && (monthCount >= 2 || hasDiscreteTimeFolders)) {
+      rawSuggestions.push({
         id: 'by_month',
-        label: hasChannelField ? 'By Month (Multi-Channel)' : 'By Month',
+        title: hasChannelField ? 'Separate by Month (Multi-Channel)' : 'Separate by Month',
+        description: 'Combines all recordings within each calendar month into one long timeline.',
         granularity: 'month',
-        combineMode: baseCombineMode,
-        groupByFieldIds: [...siteContextIds, 'date:month'],
-        channelFieldId: detectedChannelFieldId,
-        sortBy: 'timestamp',
-        rootPrefix,
-        includeSubfolders,
-        updatedAt: now,
-      },
-    });
+        recommended: false,
+        definition: {
+          id: 'by_month',
+          label: hasChannelField ? 'By Month (Multi-Channel)' : 'By Month',
+          granularity: 'month',
+          combineMode: baseCombineMode,
+          groupByFieldIds: [...siteContextIds, 'date:month'],
+          channelFieldId: detectedChannelFieldId,
+          sortBy: 'timestamp',
+          rootPrefix,
+          includeSubfolders,
+          updatedAt: now,
+        },
+      });
+    }
 
-    rawSuggestions.push({
-      id: 'by_year',
-      title: hasChannelField ? 'Separate by Year (Multi-Channel)' : 'Separate by Year',
-      description: 'Combines all recordings within each year into a single archive timeline.',
-      granularity: 'year',
-      recommended: false,
-      definition: {
+    if (hasDates && (yearCount >= 2 || hasDiscreteTimeFolders)) {
+      rawSuggestions.push({
         id: 'by_year',
-        label: hasChannelField ? 'By Year (Multi-Channel)' : 'By Year',
+        title: hasChannelField ? 'Separate by Year (Multi-Channel)' : 'Separate by Year',
+        description: 'Combines all recordings within each year into a single archive timeline.',
         granularity: 'year',
-        combineMode: baseCombineMode,
-        groupByFieldIds: ['date:year'],
-        channelFieldId: detectedChannelFieldId,
-        sortBy: 'timestamp',
-        rootPrefix,
-        includeSubfolders,
-        updatedAt: now,
-      },
-    });
+        recommended: false,
+        definition: {
+          id: 'by_year',
+          label: hasChannelField ? 'By Year (Multi-Channel)' : 'By Year',
+          granularity: 'year',
+          combineMode: baseCombineMode,
+          groupByFieldIds: ['date:year'],
+          channelFieldId: detectedChannelFieldId,
+          sortBy: 'timestamp',
+          rootPrefix,
+          includeSubfolders,
+          updatedAt: now,
+        },
+      });
+    }
   }
 
   // 3. Categorical / Site / Folder grouping (e.g., CAF, BUS, PED, STR or deployment folders)
@@ -1099,7 +1457,7 @@ export function analyzeRecordingStructure(
       title: `Separate by ${cf.label}`,
       description: `Combines all files sharing each ${cf.label.toLowerCase()} value into one recording.`,
       granularity: 'category',
-      recommended: !hasChannelField && !hasDates,
+      recommended: !hasChannelField && !allowTimeSlices,
       definition: {
         id: `by_${cf.id}`,
         label: `By ${cf.label}`,
@@ -1120,7 +1478,7 @@ export function analyzeRecordingStructure(
       title: `Separate by Folder (${ff.sampleValues.slice(0, 3).join(', ')})`,
       description: 'Combines all audio files inside each top-level folder into one recording.',
       granularity: 'folder',
-      recommended: !hasChannelField && !hasDates,
+      recommended: !hasChannelField && !allowTimeSlices,
       definition: {
         id: `by_${ff.id}`,
         label: 'By Folder',
@@ -1136,19 +1494,21 @@ export function analyzeRecordingStructure(
     });
   }
 
-  // 4. All files combined as one continuous recording
+  // 4. All files combined as one continuous/multi-channel recording (when not already covered cleanly)
   if (files.length >= 2) {
     rawSuggestions.push({
       id: 'all_combined',
       title: hasChannelField
-        ? 'Single Continuous Recording (All Files, Multi-Channel)'
+        ? 'Single Multi-Channel Recording (All Files)'
         : 'Single Continuous Recording (All Files)',
-      description: 'Combines every scanned audio file in this source into one continuous timeline.',
+      description: hasChannelField
+        ? 'Combines every scanned audio file into one synchronized multi-channel recording.'
+        : 'Combines every scanned audio file in this source into one continuous timeline.',
       granularity: 'all',
       recommended: false,
       definition: {
         id: 'all_combined',
-        label: options?.sourceLabel ? `${options.sourceLabel} (All Combined)` : 'All Files Combined',
+        label: options?.sourceLabel ? `${options.sourceLabel} (Combined)` : 'All Files Combined',
         granularity: 'all',
         combineMode: baseCombineMode,
         groupByFieldIds: [],
@@ -1167,7 +1527,11 @@ export function analyzeRecordingStructure(
     title: 'Individual Files (No Combining)',
     description: 'Treat each audio file as a separate recording.',
     granularity: 'individual',
-    recommended: !hasChannelField && !hasDates && categoryFields.length === 0 && folderFields.length === 0,
+    recommended:
+      !hasChannelField &&
+      !allowTimeSlices &&
+      categoryFields.length === 0 &&
+      folderFields.length === 0,
     definition: {
       id: 'individual',
       label: 'Individual Files',
@@ -1189,8 +1553,6 @@ export function analyzeRecordingStructure(
   for (const cand of rawSuggestions) {
     const recs = buildDefinedRecordings(files, cand.definition);
     const sig = `${cand.definition.combineMode}::${recs.map((r) => `${r.fileCount}x${r.channelCount}`).join(',')}`;
-    // Always keep 'channel_group', 'by_day', 'by_month', 'by_year', and 'individual' visible when dates exist;
-    // skip redundant intermediate suggestions only if identical to an earlier non-date suggestion
     const isTemporalPreset =
       cand.granularity === 'hour' ||
       cand.granularity === 'day' ||
@@ -1223,6 +1585,9 @@ export function analyzeRecordingStructure(
     detectedChannelFieldId,
     hasDates,
     hasTimes,
+    hasDiscreteTimeFolders,
+    allowTimeSlices,
+    timeSliceNote,
     docInsights,
     suggestions: evaluated,
   };
@@ -1246,8 +1611,12 @@ export async function scanSourceFilesForStructure(
 ): Promise<StructureScanResult> {
   const maxFiles = options?.maxFiles ?? 600;
   const maxDepth = options?.includeSubfolders === false ? 0 : (options?.maxDepth ?? 4);
+  const maxFolders = 120;
   const files: ScannedAudioFile[] = [];
+  const docEntries: ScannedDocEntry[] = [];
   const seenUris = new Set<string>();
+  const seenDocUris = new Set<string>();
+  const visitedPrefixes = new Set<string>([rootPrefix]);
   let scannedFolders = 0;
   let truncated = false;
 
@@ -1255,7 +1624,7 @@ export async function scanSourceFilesForStructure(
     { prefix: rootPrefix, dirParts: [], depth: 0, preloaded: options?.seedEntries },
   ];
 
-  while (queue.length > 0 && files.length < maxFiles) {
+  while (queue.length > 0 && files.length < maxFiles && scannedFolders < maxFolders) {
     const batch = queue.splice(0, 4);
     const results = await Promise.all(
       batch.map(async (node) => {
@@ -1281,19 +1650,33 @@ export async function scanSourceFilesForStructure(
           break;
         }
         if (entry.isDir) {
-          if (node.depth < maxDepth) {
+          if (node.depth < maxDepth && !visitedPrefixes.has(entry.uri)) {
+            visitedPrefixes.add(entry.uri);
             const folderName = entry.name.replace(/\/+$/, '');
             queue.push({
               prefix: entry.uri,
               dirParts: [...node.dirParts, folderName],
               depth: node.depth + 1,
             });
-          } else {
+          } else if (node.depth >= maxDepth) {
             truncated = true;
           }
         } else if (entry.kind === 'audio' && !seenUris.has(entry.uri)) {
           seenUris.add(entry.uri);
           files.push({
+            sourceId,
+            uri: entry.uri,
+            name: entry.name,
+            dirParts: node.dirParts,
+            sizeBytes: entry.sizeBytes,
+          });
+        } else if (
+          docEntries.length < 16 &&
+          !seenDocUris.has(entry.uri) &&
+          (isDocumentationEntryName(entry.name) || isStructuredMetadataEntryName(entry.name))
+        ) {
+          seenDocUris.add(entry.uri);
+          docEntries.push({
             sourceId,
             uri: entry.uri,
             name: entry.name,
@@ -1307,12 +1690,13 @@ export async function scanSourceFilesForStructure(
     options?.onProgress?.({ filesFound: files.length, foldersScanned: scannedFolders });
   }
 
-  if (queue.length > 0 && files.length >= maxFiles) {
+  if (queue.length > 0 && (files.length >= maxFiles || scannedFolders >= maxFolders)) {
     truncated = true;
   }
 
   return {
     files,
+    docEntries,
     scannedFolders,
     truncated,
     rootPrefix,
@@ -1335,8 +1719,12 @@ export async function scanDriveFilesForStructure(
 ): Promise<StructureScanResult> {
   const maxFiles = options?.maxFiles ?? 600;
   const maxDepth = options?.includeSubfolders === false ? 0 : (options?.maxDepth ?? 4);
+  const maxFolders = 120;
   const files: ScannedAudioFile[] = [];
+  const docEntries: ScannedDocEntry[] = [];
   const seenIds = new Set<string>();
+  const seenDocIds = new Set<string>();
+  const visitedFolders = new Set<string>([rootFolderId]);
   let scannedFolders = 0;
   let truncated = false;
 
@@ -1344,7 +1732,7 @@ export async function scanDriveFilesForStructure(
     { folderId: rootFolderId, dirParts: [], depth: 0, preloaded: options?.seedItems },
   ];
 
-  while (queue.length > 0 && files.length < maxFiles) {
+  while (queue.length > 0 && files.length < maxFiles && scannedFolders < maxFolders) {
     const batch = queue.splice(0, 3);
     const results = await Promise.all(
       batch.map(async (node) => {
@@ -1367,18 +1755,34 @@ export async function scanDriveFilesForStructure(
           break;
         }
         if (item.isFolder) {
-          if (node.depth < maxDepth) {
+          if (node.depth < maxDepth && !visitedFolders.has(item.id)) {
+            visitedFolders.add(item.id);
             queue.push({
               folderId: item.id,
               dirParts: [...node.dirParts, item.name],
               depth: node.depth + 1,
             });
-          } else {
+          } else if (node.depth >= maxDepth) {
             truncated = true;
           }
         } else if (item.kind === 'audio' && !seenIds.has(item.id)) {
           seenIds.add(item.id);
           files.push({
+            sourceId: connectedSourceId,
+            uri: item.id,
+            name: item.name,
+            dirParts: node.dirParts,
+            sizeBytes: item.sizeBytes,
+          });
+        } else if (
+          docEntries.length < 16 &&
+          !seenDocIds.has(item.id) &&
+          (item.isDoc ||
+            isDocumentationEntryName(item.name) ||
+            isStructuredMetadataEntryName(item.name))
+        ) {
+          seenDocIds.add(item.id);
+          docEntries.push({
             sourceId: connectedSourceId,
             uri: item.id,
             name: item.name,
@@ -1392,8 +1796,13 @@ export async function scanDriveFilesForStructure(
     options?.onProgress?.({ filesFound: files.length, foldersScanned: scannedFolders });
   }
 
+  if (queue.length > 0 && (files.length >= maxFiles || scannedFolders >= maxFolders)) {
+    truncated = true;
+  }
+
   return {
     files,
+    docEntries,
     scannedFolders,
     truncated,
     rootPrefix: rootFolderId,

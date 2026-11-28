@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   BookOpen,
   Check,
@@ -74,23 +74,24 @@ export const DefineRecordingsPanel: React.FC<DefineRecordingsPanelProps> = ({
   const [userTouched, setUserTouched] = useState(Boolean(initialDefinition));
   const [showCustomRule, setShowCustomRule] = useState(false);
 
-  // Auto-select recommended suggestion once scan finishes if user hasn't picked one yet
-  useEffect(() => {
-    if (userTouched && draft) return;
-    const rec = analysis.suggestions.find((s) => s.recommended) ?? analysis.suggestions[0];
-    if (rec) {
-      setDraft({ ...rec.definition, rootPrefix, includeSubfolders });
-    }
-  }, [analysis.suggestions, userTouched, draft, rootPrefix, includeSubfolders]);
+  const recommendedDefinition = useMemo(
+    () =>
+      analysis.suggestions.find((s) => s.recommended)?.definition ??
+      analysis.suggestions[0]?.definition ??
+      null,
+    [analysis.suggestions],
+  );
+
+  const activeDraft = userTouched && draft ? draft : recommendedDefinition;
 
   const effectiveDraft: RecordingStructureDefinition | null = useMemo(() => {
-    if (!draft) return null;
+    if (!activeDraft) return null;
     return {
-      ...draft,
+      ...activeDraft,
       rootPrefix,
       includeSubfolders,
     };
-  }, [draft, rootPrefix, includeSubfolders]);
+  }, [activeDraft, rootPrefix, includeSubfolders]);
 
   const previewRecordings = useMemo(
     () => (effectiveDraft ? buildDefinedRecordings(scannedFiles, effectiveDraft) : []),
@@ -98,8 +99,19 @@ export const DefineRecordingsPanel: React.FC<DefineRecordingsPanelProps> = ({
   );
 
   const selectableFields = useMemo(
-    () => analysis.fields.filter((f) => f.role !== 'constant' && f.role !== 'channel'),
-    [analysis.fields],
+    () =>
+      analysis.fields.filter((f) => {
+        if (f.role === 'constant' || f.role === 'channel') return false;
+        if (
+          !analysis.allowTimeSlices &&
+          f.source === 'derived_date' &&
+          !(effectiveDraft?.groupByFieldIds.includes(f.id) ?? false)
+        ) {
+          return false;
+        }
+        return true;
+      }),
+    [analysis.fields, analysis.allowTimeSlices, effectiveDraft?.groupByFieldIds],
   );
 
   const channelFields = useMemo(
@@ -250,6 +262,12 @@ export const DefineRecordingsPanel: React.FC<DefineRecordingsPanelProps> = ({
             <div className="structure-doc-notes">
               <BookOpen size={12} color="#7dd3fc" />
               <span>{analysis.docInsights.join(' · ')}</span>
+            </div>
+          )}
+          {analysis.timeSliceNote && (
+            <div className="structure-doc-notes" style={{ opacity: 0.85 }}>
+              <SlidersHorizontal size={11} color="#94a3b8" />
+              <span>{analysis.timeSliceNote}</span>
             </div>
           )}
         </div>

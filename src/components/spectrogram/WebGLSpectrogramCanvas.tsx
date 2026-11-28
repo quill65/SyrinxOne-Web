@@ -15,6 +15,7 @@ export interface SpectrogramRenderRow {
   viewRange: TimeFreqRange;
   topPx: number;
   heightPx: number;
+  muted?: boolean;
   bitmapFallbackUrl?: string;
 }
 
@@ -51,6 +52,7 @@ uniform float u_gainDb;
 uniform float u_floorNorm;    // 0.0..0.95 background cutoff threshold
 uniform float u_baseFloorDb;
 uniform float u_spanDb;
+uniform float u_mute;
 
 void main() {
   // Spectrogram texture layout: width = numFreqBins (x), height = numTimeBins (y)
@@ -66,7 +68,13 @@ void main() {
   float val = texture(u_specTex, vec2(fNorm, tNorm)).r;
   float level = clamp((val + u_gainDb - u_baseFloorDb) / max(1.0, u_spanDb), 0.0, 1.0);
   float norm = (u_floorNorm > 0.0 && level < u_floorNorm) ? 0.0 : level;
-  outColor = texture(u_lutTex, vec2(norm, 0.5));
+  vec4 col = texture(u_lutTex, vec2(norm, 0.5));
+  if (u_mute > 0.0) {
+    float lum = dot(col.rgb, vec3(0.299, 0.587, 0.114));
+    vec3 mutedRgb = mix(col.rgb, vec3(lum), 0.72) * 0.56;
+    col = vec4(mutedRgb, col.a);
+  }
+  outColor = col;
 }`;
 
 function compileShader(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
@@ -94,6 +102,7 @@ interface GlResources {
   uFloor: WebGLUniformLocation | null;
   uBaseFloor: WebGLUniformLocation | null;
   uSpan: WebGLUniformLocation | null;
+  uMute: WebGLUniformLocation | null;
 }
 
 export const WebGLSpectrogramCanvas: React.FC<Props> = ({
@@ -185,6 +194,7 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
       uFloor: gl.getUniformLocation(program, 'u_floorNorm'),
       uBaseFloor: gl.getUniformLocation(program, 'u_baseFloorDb'),
       uSpan: gl.getUniformLocation(program, 'u_spanDb'),
+      uMute: gl.getUniformLocation(program, 'u_mute'),
     };
     uploadedColormapRef.current = null;
 
@@ -223,10 +233,10 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
 
     const scaleY = pxH / Math.max(1, height);
 
-    // Clear full canvas stage once
+    // Clear full canvas stage once (transparent so waveform strips remain untouched)
     gl.disable(gl.SCISSOR_TEST);
     gl.viewport(0, 0, pxW, pxH);
-    gl.clearColor(0.043, 0.059, 0.078, 1.0);
+    gl.clearColor(0.0, 0.0, 0.0, 0.0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     // Collect currently active matrices so stale textures are freed
@@ -315,6 +325,7 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
       gl.scissor(0, vyBot, pxW, rh);
       gl.uniform2f(res.uTime, t0, t1);
       gl.uniform2f(res.uFreq, f0, f1);
+      gl.uniform1f(res.uMute, row.muted ? 1.0 : 0.0);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
 
@@ -346,6 +357,7 @@ export const WebGLSpectrogramCanvas: React.FC<Props> = ({
                 height: `${row.heightPx}px`,
                 display: 'block',
                 imageRendering: displaySettings.interpolation === 'nearest' ? 'pixelated' : 'auto',
+                filter: row.muted ? 'saturate(0.28) brightness(0.58)' : undefined,
                 userSelect: 'none',
               }}
             />

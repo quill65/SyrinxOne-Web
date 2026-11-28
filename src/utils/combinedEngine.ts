@@ -1398,6 +1398,7 @@ export class CombinedEngineProxy implements AudioEngineClient {
     fileId: string,
     startSec: number,
     endSec: number,
+    channel?: number,
   ): Promise<ArrayBuffer> {
     const rec = this.combinedMap.get(fileId);
     if (!rec) {
@@ -1411,6 +1412,11 @@ export class CombinedEngineProxy implements AudioEngineClient {
 
     const sampleRate = rec.sampleRate;
     const numCh = Math.max(1, rec.numChannels);
+    const singleChannel =
+      channel !== undefined && Number.isFinite(channel)
+        ? Math.max(0, Math.min(numCh - 1, Math.floor(channel)))
+        : undefined;
+    const outChCount = singleChannel !== undefined ? 1 : numCh;
     const decodedChunks: Float32Array[][] = [];
 
     const decodeTargetSlice = async (
@@ -1477,38 +1483,50 @@ export class CombinedEngineProxy implements AudioEngineClient {
 
     for (const ov of overlaps) {
       if (rec.hasVirtualChannels && ov.seg.channelFiles && ov.seg.channelFiles.length > 1) {
-        const chTracks = await Promise.all(
-          Array.from({ length: numCh }, (_, c) => {
-            const target = this.resolveSegmentTarget(rec, ov.seg, c);
-            return decodeTargetSlice(target, ov.segLocalStart, ov.segLocalEnd);
-          }),
-        );
-        const maxLen = chTracks.reduce((m, t) => Math.max(m, t.channels[0]?.length ?? 0), 0);
-        const sliced: Float32Array[] = chTracks.map((t) => {
-          const ch0 = t.channels[0] ?? new Float32Array(0);
-          if (ch0.length === maxLen) return ch0;
-          const padded = new Float32Array(maxLen);
-          padded.set(ch0);
-          return padded;
-        });
-        decodedChunks.push(sliced);
-      } else {
-        const target = this.resolveSegmentTarget(rec, ov.seg, 0);
-        const dec = await decodeTargetSlice(target, ov.segLocalStart, ov.segLocalEnd);
-        const sliced: Float32Array[] = [];
-        for (let c = 0; c < numCh; c++) {
-          sliced.push(dec.channels[Math.min(c, dec.channels.length - 1)] ?? new Float32Array(0));
+        if (singleChannel !== undefined) {
+          const target = this.resolveSegmentTarget(rec, ov.seg, singleChannel);
+          const dec = await decodeTargetSlice(target, ov.segLocalStart, ov.segLocalEnd);
+          const srcCh = dec.channels[Math.min(target.innerChannel, dec.channels.length - 1)] ?? new Float32Array(0);
+          decodedChunks.push([srcCh]);
+        } else {
+          const chTracks = await Promise.all(
+            Array.from({ length: numCh }, (_, c) => {
+              const target = this.resolveSegmentTarget(rec, ov.seg, c);
+              return decodeTargetSlice(target, ov.segLocalStart, ov.segLocalEnd);
+            }),
+          );
+          const maxLen = chTracks.reduce((m, t) => Math.max(m, t.channels[0]?.length ?? 0), 0);
+          const sliced: Float32Array[] = chTracks.map((t) => {
+            const ch0 = t.channels[0] ?? new Float32Array(0);
+            if (ch0.length === maxLen) return ch0;
+            const padded = new Float32Array(maxLen);
+            padded.set(ch0);
+            return padded;
+          });
+          decodedChunks.push(sliced);
         }
-        decodedChunks.push(sliced);
+      } else {
+        const target = this.resolveSegmentTarget(rec, ov.seg, singleChannel ?? 0);
+        const dec = await decodeTargetSlice(target, ov.segLocalStart, ov.segLocalEnd);
+        if (singleChannel !== undefined) {
+          const srcCh = dec.channels[Math.min(singleChannel, dec.channels.length - 1)] ?? new Float32Array(0);
+          decodedChunks.push([srcCh]);
+        } else {
+          const sliced: Float32Array[] = [];
+          for (let c = 0; c < numCh; c++) {
+            sliced.push(dec.channels[Math.min(c, dec.channels.length - 1)] ?? new Float32Array(0));
+          }
+          decodedChunks.push(sliced);
+        }
       }
     }
 
     const totalFrames = decodedChunks.reduce((acc, chs) => acc + (chs[0]?.length ?? 0), 0);
-    const outChannels = Array.from({ length: numCh }, () => new Float32Array(Math.max(1, totalFrames)));
+    const outChannels = Array.from({ length: outChCount }, () => new Float32Array(Math.max(1, totalFrames)));
     let cursor = 0;
     for (const chs of decodedChunks) {
       const len = chs[0]?.length ?? 0;
-      for (let c = 0; c < numCh; c++) {
+      for (let c = 0; c < outChCount; c++) {
         outChannels[c].set(chs[c], cursor);
       }
       cursor += len;

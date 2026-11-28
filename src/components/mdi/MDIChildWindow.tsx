@@ -110,7 +110,10 @@ export const MDIChildWindow: React.FC<Props> = ({ win, file, isActive }) => {
     const en = win.selection
       ? Math.max(win.selection.startSec, win.selection.endSec)
       : win.viewRange.endSec;
-    void audioPlayer.play(engine, file.fileId, s, en).catch((err) => {
+    const ch = win.selection
+      ? Math.max(0, win.selection.channel - 1)
+      : win.specParams.channel;
+    void audioPlayer.play(engine, file.fileId, s, en, ch).catch((err) => {
       useWorkspaceStore
         .getState()
         .setError(err instanceof Error ? err.message : 'Unable to play audio');

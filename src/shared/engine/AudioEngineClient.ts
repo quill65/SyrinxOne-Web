@@ -126,6 +126,8 @@ export class HttpAudioEngineClient implements AudioEngineClient {
   private fileIdAliases = new Map<string, string>();
   private reopenPromises = new Map<string, Promise<string | null>>();
   private restoreSourcePromises = new Map<string, Promise<boolean>>();
+  private browseInflight = new Map<string, Promise<BrowseEntry[]>>();
+  private sourceBrowseQueue = new Map<string, Promise<void>>();
 
   constructor(config: EngineConfig) {
     this.baseUrl = config.baseUrl.replace(/\/+$/, '');
@@ -155,6 +157,34 @@ export class HttpAudioEngineClient implements AudioEngineClient {
       return /\(404\)/.test(err.message) && /not loaded in session|not found/i.test(err.message);
     }
     return false;
+  }
+
+  private isRemoteArchiveRaceError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err ?? '');
+    if (!msg) return false;
+    return (
+      /syrinx_remote_archives|\.part['"]?\s*->/i.test(msg) ||
+      (/\(502\)/.test(msg) && /Errno 2|No such file or directory/i.test(msg))
+    );
+  }
+
+  private async enqueueSourceBrowse<T>(sourceId: string, op: () => Promise<T>): Promise<T> {
+    const prev = this.sourceBrowseQueue.get(sourceId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((res) => {
+      release = res;
+    });
+    const tail = prev.then(() => gate, () => gate);
+    this.sourceBrowseQueue.set(sourceId, tail);
+    await prev.catch(() => undefined);
+    try {
+      return await op();
+    } finally {
+      release();
+      if (this.sourceBrowseQueue.get(sourceId) === tail) {
+        this.sourceBrowseQueue.delete(sourceId);
+      }
+    }
   }
 
   private async ensureSourceRestored(sourceId: string): Promise<boolean> {
@@ -301,16 +331,37 @@ export class HttpAudioEngineClient implements AudioEngineClient {
   }
 
   async browseSource(sourceId: string, prefix = '', limit = 1000): Promise<BrowseEntry[]> {
-    const q = new URLSearchParams({ prefix, limit: String(limit) });
-    const url = `/api/sources/${encodeURIComponent(sourceId)}/browse?${q.toString()}`;
-    try {
-      return await this.requestJson(url);
-    } catch (err) {
-      if (this.isSessionMissingError(err) && (await this.ensureSourceRestored(sourceId))) {
-        return await this.requestJson(url);
+    const dedupeKey = `${sourceId}::${prefix}::${limit}`;
+    const existing = this.browseInflight.get(dedupeKey);
+    if (existing) return existing;
+
+    const p = this.enqueueSourceBrowse(sourceId, async () => {
+      const q = new URLSearchParams({ prefix, limit: String(limit) });
+      const url = `/api/sources/${encodeURIComponent(sourceId)}/browse?${q.toString()}`;
+      const maxAttempts = 3;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          return await this.requestJson<BrowseEntry[]>(url);
+        } catch (err) {
+          if (this.isSessionMissingError(err) && (await this.ensureSourceRestored(sourceId))) {
+            return await this.requestJson<BrowseEntry[]>(url);
+          }
+          if (attempt < maxAttempts && this.isRemoteArchiveRaceError(err)) {
+            await new Promise((r) => setTimeout(r, attempt * 700));
+            continue;
+          }
+          throw err;
+        }
       }
-      throw err;
-    }
+      return await this.requestJson<BrowseEntry[]>(url);
+    }).finally(() => {
+      if (this.browseInflight.get(dedupeKey) === p) {
+        this.browseInflight.delete(dedupeKey);
+      }
+    });
+
+    this.browseInflight.set(dedupeKey, p);
+    return p;
   }
 
   async openAudio(
@@ -326,21 +377,32 @@ export class HttpAudioEngineClient implements AudioEngineClient {
         ? { maxDurationSec: options.maxDurationSec }
         : {}),
     });
-    let info: AudioFileInfo;
-    try {
-      info = await this.requestJson<AudioFileInfo>('/api/audio/open', {
-        method: 'POST',
-        body: payload,
-      });
-    } catch (err) {
-      if (this.isSessionMissingError(err) && (await this.ensureSourceRestored(sourceId))) {
+    let info: AudioFileInfo | undefined;
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
         info = await this.requestJson<AudioFileInfo>('/api/audio/open', {
           method: 'POST',
           body: payload,
         });
-      } else {
+        break;
+      } catch (err) {
+        if (this.isSessionMissingError(err) && (await this.ensureSourceRestored(sourceId))) {
+          info = await this.requestJson<AudioFileInfo>('/api/audio/open', {
+            method: 'POST',
+            body: payload,
+          });
+          break;
+        }
+        if (attempt < maxAttempts && this.isRemoteArchiveRaceError(err)) {
+          await new Promise((r) => setTimeout(r, attempt * 700));
+          continue;
+        }
         throw err;
       }
+    }
+    if (!info) {
+      throw new Error('Failed to open audio file');
     }
     this.fileRegistry.set(info.fileId, { sourceId, uri, options });
     return info;

@@ -272,7 +272,10 @@ export const App: React.FC = () => {
     const end = activeWin.selection
       ? Math.max(activeWin.selection.startSec, activeWin.selection.endSec)
       : activeWin.viewRange.endSec;
-    void audioPlayer.play(state.engine, file.fileId, start, end).catch((err) => {
+    const ch = activeWin.selection
+      ? Math.max(0, activeWin.selection.channel - 1)
+      : activeWin.specParams.channel;
+    void audioPlayer.play(state.engine, file.fileId, start, end, ch).catch((err) => {
       setError(err instanceof Error ? err.message : 'Unable to play audio');
     });
   };

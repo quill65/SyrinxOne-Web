@@ -922,7 +922,14 @@ async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+        ws: false,
+        watch: {
+          ignored: ['**/dist/**', '**/.git/**'],
+        },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -934,9 +941,25 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`SyrinxOne web server listening on http://0.0.0.0:${PORT}`);
+  });
+  httpServer.keepAliveTimeout = 65_000;
+  httpServer.headersTimeout = 66_000;
+  httpServer.on('error', (err) => {
+    console.error('[server] HTTP server error:', err);
   });
 }
 
-void startServer();
+process.on('unhandledRejection', (reason) => {
+  console.error('[server] Unhandled promise rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[server] Uncaught exception:', err);
+});
+
+void startServer().catch((err) => {
+  console.error('[server] Fatal startup error:', err);
+  process.exit(1);
+});

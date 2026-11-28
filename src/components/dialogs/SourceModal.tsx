@@ -215,10 +215,32 @@ function SourceKindIcon({ kind }: { kind: string }) {
   return <Cloud size={14} color="#60a5fa" />;
 }
 
+const DEFAULT_CLOUD_SAFE_PROVIDERS = [
+  'open_catalog',
+  'zenodo',
+  'huggingface',
+  'inaturalist',
+  'xenocanto',
+  'freesound',
+];
+
+function isFigshareForbiddenMsg(msg: string): boolean {
+  return /figshare/i.test(msg) && /403|forbidden/i.test(msg);
+}
+
+function formatProviderWarning(raw: string): string {
+  const cleaned = raw.replace(/\s*For more information check:\s*https?:\/\/\S+/gi, '').trim();
+  if (isFigshareForbiddenMsg(cleaned)) {
+    return 'Figshare Open Datasets blocked the request from this cloud engine (HTTP 403). Use Zenodo, Hugging Face, iNaturalist, or connect a local SyrinxOne engine to search Figshare.';
+  }
+  return cleaned;
+}
+
 export const SourceModal: React.FC = () => {
   const show = useWorkspaceStore((s) => s.showSourceModal);
   const sourceReturnToBrowser = useWorkspaceStore((s) => s.sourceReturnToBrowser);
   const engine = useWorkspaceStore((s) => s.engine);
+  const backendUrl = useWorkspaceStore((s) => s.backendUrl);
   const activeSourceId = useWorkspaceStore((s) => s.activeSourceId);
   const setActiveSource = useWorkspaceStore((s) => s.setActiveSource);
   const openAboutArchive = useWorkspaceStore((s) => s.openAboutArchive);
@@ -273,6 +295,19 @@ export const SourceModal: React.FC = () => {
   const [connectingId, setConnectingId] = useState<string | null>(null);
   const [inlineKeyCandidateId, setInlineKeyCandidateId] = useState<string | null>(null);
   const [inlineKeyDraft, setInlineKeyDraft] = useState('');
+  const [blockedProviders, setBlockedProviders] = useState<Record<string, boolean>>({});
+
+  const isCloudRunEngine = useMemo(() => {
+    const url = (backendUrl || '').trim();
+    if (/\.run\.app(?:[:/]|$)/i.test(url)) return true;
+    if (!url && typeof window !== 'undefined' && /\.run\.app$/i.test(window.location.hostname)) {
+      return true;
+    }
+    return false;
+  }, [backendUrl]);
+
+  const isProviderBlocked = (providerId: string): boolean =>
+    Boolean(blockedProviders[providerId]) || (isCloudRunEngine && providerId === 'figshare');
 
   const providerMap = useMemo(() => {
     const map: Record<string, DiscoveryProviderInfo> = {};
@@ -340,6 +375,10 @@ export const SourceModal: React.FC = () => {
   };
 
   useEffect(() => {
+    setBlockedProviders({});
+  }, [backendUrl]);
+
+  useEffect(() => {
     if (!show) return;
     setError(null);
     setRecentSources(loadRecentSources());
@@ -396,7 +435,7 @@ export const SourceModal: React.FC = () => {
           true,
         );
       } catch (err) {
-        setError(err instanceof Error ? err.message : `Failed to reconnect ${item.displayName}`);
+        setError(formatProviderWarning(err instanceof Error ? err.message : `Failed to reconnect ${item.displayName}`));
       } finally {
         setConnectingId(null);
       }
@@ -471,18 +510,48 @@ export const SourceModal: React.FC = () => {
       for (const [k, v] of Object.entries(providerKeys)) {
         if (v.trim()) cleanedKeys[k] = v.trim();
       }
+      const explicitSelection = selectedProviderIds.length > 0;
+      let providerIdsToQuery: string[] | undefined;
+      if (explicitSelection) {
+        providerIdsToQuery = selectedProviderIds;
+      } else if (providers.length > 0) {
+        const filtered = providers
+          .filter((p) => !isProviderBlocked(p.providerId))
+          .map((p) => p.providerId);
+        providerIdsToQuery = filtered.length > 0 ? filtered : undefined;
+      } else if (isCloudRunEngine) {
+        providerIdsToQuery = DEFAULT_CLOUD_SAFE_PROVIDERS;
+      }
+
       const res = await engine.discoverSources({
         prompt: query,
-        providerIds: selectedProviderIds.length > 0 ? selectedProviderIds : undefined,
+        providerIds: providerIdsToQuery,
         providerKeys: Object.keys(cleanedKeys).length > 0 ? cleanedKeys : undefined,
         verifyTopN: autoVerify ? 8 : 0,
         limit: 18,
       });
+
+      const newlyBlocked: Record<string, boolean> = {};
+      const visibleWarnings: string[] = [];
+      for (const w of res.warnings ?? []) {
+        if (isFigshareForbiddenMsg(w)) {
+          newlyBlocked.figshare = true;
+          if (!explicitSelection && res.candidates.length > 0) {
+            continue;
+          }
+        }
+        visibleWarnings.push(formatProviderWarning(w));
+      }
+      if (Object.keys(newlyBlocked).length > 0) {
+        setBlockedProviders((prev) => ({ ...prev, ...newlyBlocked }));
+      }
+
       setCandidates(res.candidates);
-      setDiscoverWarnings(res.warnings);
+      setDiscoverWarnings(visibleWarnings);
       setHasSearched(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Archive search failed');
+      const msg = err instanceof Error ? err.message : 'Archive search failed';
+      setError(formatProviderWarning(msg));
     } finally {
       setDiscoverBusy(false);
     }
@@ -498,10 +567,20 @@ export const SourceModal: React.FC = () => {
     try {
       const verification = await engine.verifySource(buildCandidateConnectRequest(cand));
       setCandidates((prev) =>
-        prev.map((c) => (c.candidateId === cand.candidateId ? { ...c, verification } : c)),
+        prev.map((c) =>
+          c.candidateId === cand.candidateId
+            ? {
+                ...c,
+                verification: {
+                  ...verification,
+                  message: formatProviderWarning(verification.message),
+                },
+              }
+            : c,
+        ),
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Compatibility check failed');
+      setError(formatProviderWarning(err instanceof Error ? err.message : 'Compatibility check failed'));
     } finally {
       setVerifyingCandidateId(null);
     }
@@ -552,7 +631,7 @@ export const SourceModal: React.FC = () => {
         true,
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to connect archive');
+      setError(formatProviderWarning(err instanceof Error ? err.message : 'Failed to connect archive'));
     } finally {
       setConnectingId(null);
     }
@@ -594,9 +673,14 @@ export const SourceModal: React.FC = () => {
     setError(null);
     try {
       const req = await buildCustomRequest();
-      setCustomVerification(await engine.verifySource(req));
+      const ver = await engine.verifySource(req);
+      setCustomVerification({
+        ...ver,
+        message: formatProviderWarning(ver.message),
+      });
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Compatibility test failed');
+      const msg = err instanceof Error ? err.message : 'Compatibility test failed';
+      setError(formatProviderWarning(msg));
     } finally {
       setCustomVerifyBusy(false);
     }
@@ -626,7 +710,8 @@ export const SourceModal: React.FC = () => {
         true,
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to connect custom source');
+      const msg = err instanceof Error ? err.message : 'Failed to connect custom source';
+      setError(formatProviderWarning(msg));
     } finally {
       setConnectBusy(false);
     }
@@ -876,6 +961,7 @@ export const SourceModal: React.FC = () => {
                 </button>
                 {providers.map((p) => {
                   const isSelected = selectedProviderIds.includes(p.providerId);
+                  const blocked = isProviderBlocked(p.providerId);
                   const hasKey =
                     p.authConfiguredOnServer || Boolean(providerKeys[p.providerId]?.trim());
                   return (
@@ -883,10 +969,15 @@ export const SourceModal: React.FC = () => {
                       key={p.providerId}
                       type="button"
                       className={`discover-provider-pill ${isSelected ? 'active' : ''}`}
-                      title={p.description}
+                      title={
+                        blocked
+                          ? `${p.description} (Skipped in All-provider search because Figshare blocks cloud-engine requests with HTTP 403)`
+                          : p.description
+                      }
                       onClick={() => toggleProviderFilter(p.providerId)}
                     >
                       <span>{p.displayName}</span>
+                      {blocked && <AlertTriangle size={10} color="#fbbf24" />}
                       {p.authRequired && !hasKey && <Lock size={10} />}
                       {p.authKind !== 'none' && hasKey && <Check size={10} color="#4ade80" />}
                     </button>
@@ -1230,22 +1321,38 @@ export const SourceModal: React.FC = () => {
                     cand.verification.status !== 'zipped_only' &&
                     cand.verification.status !== 'incompatible';
 
+                  const srText = formatSampleRate(cand.verification.sampleRateHz);
+                  const chText =
+                    cand.verification.numChannels && cand.verification.numChannels > 1
+                      ? `${cand.verification.numChannels} ch`
+                      : null;
+                  const statusNote =
+                    cand.verification.status === 'zipped_only'
+                      ? 'Archive Only'
+                      : cand.verification.status === 'incompatible'
+                        ? 'No Audio'
+                        : cand.verification.status === 'error'
+                          ? 'Probe Error'
+                          : null;
+
                   const row2Parts = [
                     cand.providerLabel,
                     cand.connectRequest.kind.toUpperCase(),
-                    cand.license,
+                    srText,
+                    chText,
                     cand.verification.audioFileCount > 0
                       ? `${cand.verification.audioFileCount}+ files`
                       : null,
                     cand.verification.formats.length > 0
                       ? cand.verification.formats.slice(0, 3).join('/')
                       : null,
-                    cand.verification.supportsRange ? 'Range' : null,
+                    statusNote,
+                    cand.license,
                   ].filter(Boolean);
 
                   return (
                     <div key={cand.candidateId} className="src-row-card">
-                      {/* Row 1: Title + Status + Compact Actions */}
+                      {/* Row 1: Full-width archive title */}
                       <div className="src-row-1">
                         <span className="src-row-icon">
                           <SourceKindIcon kind={cand.connectRequest.kind} />
@@ -1253,7 +1360,13 @@ export const SourceModal: React.FC = () => {
                         <span className="src-row-title" title={cand.title}>
                           {cand.title}
                         </span>
-                        <CompactStatusPill verification={cand.verification} />
+                      </div>
+
+                      {/* Row 2: Metadata + touchpoints / action buttons */}
+                      <div className="src-row-2">
+                        <span className="src-row-meta" title={row2Parts.join(' · ')}>
+                          {row2Parts.join(' · ')}
+                        </span>
                         <div className="src-row-actions">
                           <button
                             type="button"
@@ -1297,11 +1410,6 @@ export const SourceModal: React.FC = () => {
                             )}
                           </button>
                         </div>
-                      </div>
-
-                      {/* Row 2: Concise single-line metadata */}
-                      <div className="src-row-2" title={row2Parts.join(' · ')}>
-                        {row2Parts.join(' · ')}
                       </div>
 
                       {/* Expandable Info Drawer (only shown on user click) */}
@@ -1420,7 +1528,7 @@ export const SourceModal: React.FC = () => {
                       className={`src-row-card clickable ${isActive ? 'active' : ''}`}
                       onClick={() => void handleSelectRecent(item)}
                     >
-                      {/* Row 1: Icon + Title + Active + Compact Actions */}
+                      {/* Row 1: Icon + Full-width source title */}
                       <div className="src-row-1">
                         <span className="src-row-icon">
                           <SourceKindIcon kind={item.kind} />
@@ -1428,13 +1536,20 @@ export const SourceModal: React.FC = () => {
                         <span className="src-row-title" title={item.displayName}>
                           {item.displayName}
                         </span>
-                        {isActive && (
-                          <span className="source-active-mark">
-                            <Check size={11} /> Active
-                          </span>
-                        )}
                         {isBusy && <Loader2 size={12} className="spin" />}
+                      </div>
+
+                      {/* Row 2: Metadata + touchpoints / action buttons */}
+                      <div className="src-row-2">
+                        <span className="src-row-meta" title={row2Parts.join(' · ')}>
+                          {row2Parts.join(' · ')}
+                        </span>
                         <div className="src-row-actions" onClick={(e) => e.stopPropagation()}>
+                          {isActive && (
+                            <span className="source-active-mark">
+                              <Check size={11} /> Active
+                            </span>
+                          )}
                           <button
                             type="button"
                             className={`mdi-icon-btn ${isExpanded ? 'btn-active' : ''}`}
@@ -1464,11 +1579,6 @@ export const SourceModal: React.FC = () => {
                             <Trash2 size={12} />
                           </button>
                         </div>
-                      </div>
-
-                      {/* Row 2: Single-line metadata */}
-                      <div className="src-row-2" title={row2Parts.join(' · ')}>
-                        {row2Parts.join(' · ')}
                       </div>
 
                       {/* Expandable Info Drawer */}

@@ -303,6 +303,8 @@ export interface WorkspaceStore {
 
   mobilePane: 0 | 1 | 2;
   setMobilePane: (pane: 0 | 1 | 2) => void;
+  touchMode: 'select' | 'pan';
+  setTouchMode: (mode: 'select' | 'pan') => void;
 
   showAnnotationDrawer: boolean;
   showSpecPanel: boolean;
@@ -609,6 +611,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
         ? { showAnnotationDrawer: false }
         : {}),
     }),
+  touchMode: 'select',
+  setTouchMode: (mode) => set({ touchMode: mode }),
 
   showAnnotationDrawer: !startMobile,
   showSpecPanel: !startMobile,
@@ -730,7 +734,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
 
   openCombinedArchive: async (specs, title, options) => {
     if (specs.length === 0) return;
-    if (specs.length === 1) {
+    const hasMultiChannels = specs.some((s) => (s.channelFiles?.length ?? 0) > 1);
+    if (specs.length === 1 && !hasMultiChannels) {
       await get().openAudioFromSource(specs[0].sourceId, specs[0].uri, {
         startSec: options?.startSec,
         maxDurationSec: options?.maxDurationSec,
@@ -1004,6 +1009,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     const saved = meta?.restoreState ?? null;
     const disp: DisplaySettings = sanitizeDisplaySettings({
       ...state.defaultDisplaySettings,
+      ...(info.numChannels > 1 && saved?.displaySettings?.stackAllChannels === undefined
+        ? { stackAllChannels: true }
+        : {}),
       ...(saved?.displaySettings ?? {}),
       lockSettings: false,
     });
@@ -1470,6 +1478,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     });
     if (cleanPatch.stackAllChannels) {
       void Promise.all([get().ensureSpectrogram(windowId), get().ensureWaveform(windowId)]);
+    } else if (cleanPatch.showWaveform) {
+      void get().ensureWaveform(windowId);
     }
     schedulePersistView(get, windowId);
   },
