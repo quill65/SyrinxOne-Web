@@ -106,8 +106,8 @@ export interface WorkspaceStore {
   activeSourceDisplayName: string;
   setActiveSource: (sourceId: string, displayName?: string) => void;
 
-  mobilePane: 0 | 1 | 2;
-  setMobilePane: (pane: 0 | 1 | 2) => void;
+  mobilePane: 0 | 1 | 2 | 3;
+  setMobilePane: (pane: 0 | 1 | 2 | 3) => void;
   touchMode: 'select' | 'pan';
   setTouchMode: (mode: 'select' | 'pan') => void;
 

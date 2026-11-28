@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity,
+  BookOpen,
   Camera,
   ChevronLeft,
   ChevronRight,
@@ -8,6 +9,7 @@ import {
   Database,
   FolderOpen,
   Grid,
+  HelpCircle,
   Keyboard,
   Layers,
   LogOut,
@@ -46,6 +48,21 @@ import { AiExplorerPanel } from './components/panels/AiExplorerPanel';
 import { ArchiveTimelineBar } from './components/mdi/ArchiveTimelineBar';
 import { GoogleSignInButton } from './components/auth/GoogleSignInButton';
 import { googleSignIn, initAuth, logout, toGoogleUserProfile } from './auth/googleAuth';
+import { ToolsMenu } from './notebook/ToolsMenu';
+import { NotebookWorkspace } from './notebook/NotebookWorkspace';
+import { ScriptOutputModal } from './notebook/ScriptOutputModal';
+import { HelpMenu } from './components/help/HelpMenu';
+import { HelpDocsModal, StandaloneHelpShell } from './components/help/HelpDocsModal';
+import { getHelpDocIdFromUrl, type HelpDocId } from './help/helpDocs';
+import { captureActiveAcousticSnapshot } from './notebook/contextSnapshot';
+import { commitProposedAnnotationsToWorkspace } from './notebook/notebookRunner';
+import { useNotebookStore } from './notebook/notebookStore';
+import {
+  getDetachedNotebookIdFromUrl,
+  isDetachedNotebookTab,
+  publishSyncedContext,
+  startMainTabSyncBridge,
+} from './notebook/notebookSync';
 
 declare global {
   interface Window {
@@ -53,7 +70,80 @@ declare global {
   }
 }
 
+const DetachedNotebookShell: React.FC = () => {
+  const checkBackendHealth = useWorkspaceStore((s) => s.checkBackendHealth);
+  const setBackendConfig = useWorkspaceStore((s) => s.setBackendConfig);
+  const backendConnected = useWorkspaceStore((s) => s.backendConnected);
+  const backendVersion = useWorkspaceStore((s) => s.backendVersion);
+  const [activeHelpDoc, setActiveHelpDoc] = useState<HelpDocId | null>(null);
+
+  useEffect(() => {
+    const nbId = getDetachedNotebookIdFromUrl();
+    if (nbId) {
+      const nbStore = useNotebookStore.getState();
+      if (nbStore.notebooks.some((n) => n.id === nbId)) {
+        nbStore.setActiveNotebook(nbId);
+      }
+    }
+    void (async () => {
+      if (window.syrinxDesktop) {
+        const cfg = await window.syrinxDesktop.getBackendConfig();
+        setBackendConfig(cfg.baseUrl, cfg.token);
+      }
+      await checkBackendHealth();
+    })();
+  }, [checkBackendHealth, setBackendConfig]);
+
+  return (
+    <div className="app-shell nb-detached-shell">
+      <header className="top-toolbar nb-detached-header">
+        <a href="/" className="brand brand-btn" title="Open Full Spectrogram App">
+          <span className="brand-mark">S1</span>
+          <span className="brand-name">SyrinxOne Notebooks</span>
+          <span
+            className={`conn-dot ${backendConnected ? 'ok' : 'down'}`}
+            title={backendConnected ? `Engine v${backendVersion}` : 'Engine offline — using local kernel'}
+          />
+        </a>
+        <div className="toolbar-spacer" />
+        <div className="toolbar-group">
+          <ToolsMenu onOpenNotebooks={() => {}} />
+          <HelpMenu onOpenDoc={(id) => setActiveHelpDoc(id)} />
+          <a href="/" className="btn-small">
+            <Activity size={13} />
+            <span>Open Spectrogram App</span>
+          </a>
+        </div>
+      </header>
+      <NotebookWorkspace
+        onBackToSpectrogram={() => {
+          window.location.href = '/';
+        }}
+        hideBackButton
+        detached
+      />
+      <ScriptOutputModal onOpenInNotebook={() => {}} />
+      <HelpDocsModal
+        docId={activeHelpDoc}
+        onSelectDoc={setActiveHelpDoc}
+        onClose={() => setActiveHelpDoc(null)}
+      />
+    </div>
+  );
+};
+
 export const App: React.FC = () => {
+  const helpDocParam = getHelpDocIdFromUrl();
+  if (helpDocParam) {
+    return <StandaloneHelpShell initialDocId={helpDocParam} />;
+  }
+  if (isDetachedNotebookTab()) {
+    return <DetachedNotebookShell />;
+  }
+  return <MainAppShell />;
+};
+
+const MainAppShell: React.FC = () => {
   const setBackendConfig = useWorkspaceStore((s) => s.setBackendConfig);
   const checkBackendHealth = useWorkspaceStore((s) => s.checkBackendHealth);
   const backendConnected = useWorkspaceStore((s) => s.backendConnected);
@@ -66,6 +156,7 @@ export const App: React.FC = () => {
   const activeWindowId = useWorkspaceStore((s) => s.activeWindowId);
   const files = useWorkspaceStore((s) => s.files);
   const specCache = useWorkspaceStore((s) => s.spectrogramCache);
+  const annotationsCount = useWorkspaceStore((s) => s.annotations.length);
   const selectedAnnotationId = useWorkspaceStore((s) => s.selectedAnnotationId);
 
   const activeSourceDisplayName = useWorkspaceStore((s) => s.activeSourceDisplayName);
@@ -106,6 +197,8 @@ export const App: React.FC = () => {
   );
   const [showMobileTools, setShowMobileTools] = useState(false);
   const [dragOffsetPx, setDragOffsetPx] = useState(0);
+  const [workspaceView, setWorkspaceView] = useState<'spectrogram' | 'notebooks'>('spectrogram');
+  const [activeHelpDoc, setActiveHelpDoc] = useState<HelpDocId | null>(null);
 
   const shellRef = useRef<HTMLDivElement | null>(null);
   const displayInputRef = useRef<HTMLInputElement | null>(null);
@@ -164,6 +257,37 @@ export const App: React.FC = () => {
       },
     );
   }, [setGoogleAuthState]);
+
+  // Multi-tab BroadcastChannel bridge for detached ?view=notebook browser tabs
+  useEffect(() => {
+    return startMainTabSyncBridge({
+      getLatestContext: () => {
+        const snap = captureActiveAcousticSnapshot('recording');
+        return {
+          summary: snap.summary,
+          contextPayload: snap.contextPayload,
+          spectrogramImageBase64: snap.spectrogramImageBase64,
+          updatedAt: Date.now(),
+        };
+      },
+      onCommitAnnotations: (items) => {
+        commitProposedAnnotationsToWorkspace(items);
+      },
+    });
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const snap = captureActiveAcousticSnapshot('recording');
+      publishSyncedContext({
+        summary: snap.summary,
+        contextPayload: snap.contextPayload,
+        spectrogramImageBase64: snap.spectrogramImageBase64,
+        updatedAt: Date.now(),
+      });
+    }, 220);
+    return () => window.clearTimeout(timer);
+  }, [activeWindowId, windows, files, annotationsCount, specCache]);
 
   const handleGoogleSignIn = async () => {
     setGoogleSigningIn(true);
@@ -488,11 +612,13 @@ export const App: React.FC = () => {
 
     if (
       target &&
-      (target.closest('input, select, textarea') ||
+      (target.closest('input, select, textarea, pre') ||
         target.closest('.mobile-tab-strip') ||
         target.closest('.mobile-gain-bar') ||
         target.closest('.archive-bar-scrubber') ||
-        target.closest('.spec-scrollbar-wrap'))
+        target.closest('.spec-scrollbar-wrap') ||
+        target.closest('.nb-mobile-tabs') ||
+        target.closest('.nb-submenu'))
     ) {
       swipeTouchRef.current = null;
       return;
@@ -532,9 +658,9 @@ export const App: React.FC = () => {
     }
     if (st.locked !== 'horizontal') return;
 
-    // Dampen overscroll at screen edges (pane 0 right / pane 2 left)
+    // Dampen overscroll at screen edges (pane 0 right / pane 3 left)
     let clamped = dx;
-    if ((mobilePane === 0 && dx > 0) || (mobilePane === 2 && dx < 0)) {
+    if ((mobilePane === 0 && dx > 0) || (mobilePane === 3 && dx < 0)) {
       clamped = dx * 0.25;
     }
     setDragOffsetPx(clamped);
@@ -551,14 +677,14 @@ export const App: React.FC = () => {
     const velocity = Math.abs(dragOffsetPx) / elapsed;
     const threshold = Math.min(80, window.innerWidth * 0.2);
 
-    let nextPane: 0 | 1 | 2 = mobilePane;
+    let nextPane: 0 | 1 | 2 | 3 = mobilePane;
     if ((dragOffsetPx > threshold || (dragOffsetPx > 28 && velocity > 0.35)) && mobilePane > 0) {
-      nextPane = (mobilePane - 1) as 0 | 1 | 2;
+      nextPane = (mobilePane - 1) as 0 | 1 | 2 | 3;
     } else if (
       (dragOffsetPx < -threshold || (dragOffsetPx < -28 && velocity > 0.35)) &&
-      mobilePane < 2
+      mobilePane < 3
     ) {
-      nextPane = (mobilePane + 1) as 0 | 1 | 2;
+      nextPane = (mobilePane + 1) as 0 | 1 | 2 | 3;
     }
     setDragOffsetPx(0);
     if (nextPane !== mobilePane) {
@@ -792,23 +918,39 @@ export const App: React.FC = () => {
           )}
         </div>
 
-        <div className="toolbar-group desktop-only">
+        <div className="toolbar-group">
+          <ToolsMenu
+            onOpenNotebooks={() =>
+              isMobileViewport ? setMobilePane(3) : setWorkspaceView('notebooks')
+            }
+            compact={isMobileViewport}
+          />
+          <HelpMenu onOpenDoc={(id) => setActiveHelpDoc(id)} compact={isMobileViewport} />
           <button
-            className={`btn-small ${showAiPanel ? 'btn-active' : ''}`}
+            className={`btn-small desktop-only ${workspaceView === 'notebooks' ? 'btn-active' : ''}`}
+            onClick={() =>
+              setWorkspaceView((v) => (v === 'notebooks' ? 'spectrogram' : 'notebooks'))
+            }
+            title="Switch between Spectrogram Workspace and Analytic Notebooks"
+          >
+            <BookOpen size={13} /> Notebooks
+          </button>
+          <button
+            className={`btn-small desktop-only ${showAiPanel ? 'btn-active' : ''}`}
             onClick={() => setModalState('showAiPanel', !showAiPanel)}
             title="Toggle AI Bioacoustic Explorer Panel"
           >
             <Sparkles size={13} /> AI Explorer
           </button>
           <button
-            className={`btn-small ${showSpecPanel ? 'btn-active' : ''}`}
+            className={`btn-small desktop-only ${showSpecPanel ? 'btn-active' : ''}`}
             onClick={() => setModalState('showSpecPanel', !showSpecPanel)}
             title="Toggle Spectrogram Settings & Measurements Panel"
           >
             <SlidersHorizontal size={13} /> <PanelRight size={13} />
           </button>
           <button
-            className={`btn-small ${showAnnotationDrawer ? 'btn-active' : ''}`}
+            className={`btn-small desktop-only ${showAnnotationDrawer ? 'btn-active' : ''}`}
             onClick={() => setModalState('showAnnotationDrawer', !showAnnotationDrawer)}
             title="Toggle Annotation Drawer"
           >
@@ -895,6 +1037,38 @@ export const App: React.FC = () => {
                   >
                     <Keyboard size={13} /> Annotation Hotkeys
                   </button>
+                  <button
+                    onClick={() => {
+                      setShowMobileTools(false);
+                      setMobilePane(3);
+                    }}
+                  >
+                    <BookOpen size={13} /> Notebooks
+                  </button>
+                  <button
+                    onClick={() => {
+                      setShowMobileTools(false);
+                      setActiveHelpDoc('overview');
+                    }}
+                  >
+                    <HelpCircle size={13} /> Help: Overview
+                  </button>
+                  <button
+                    onClick={() => {
+                      setShowMobileTools(false);
+                      setActiveHelpDoc('subsystems');
+                    }}
+                  >
+                    <Layers size={13} /> Help: Subsystems &amp; Features
+                  </button>
+                  <button
+                    onClick={() => {
+                      setShowMobileTools(false);
+                      setActiveHelpDoc('setup');
+                    }}
+                  >
+                    <HelpCircle size={13} /> Help: Capabilities &amp; Setup
+                  </button>
                   <hr />
                   {hasDriveToken ? (
                     <button
@@ -959,6 +1133,14 @@ export const App: React.FC = () => {
               <Sparkles size={13} />
               <span>AI</span>
             </button>
+            <button
+              type="button"
+              className={`mobile-pane-tab ${mobilePane === 3 ? 'active' : ''}`}
+              onClick={() => setMobilePane(3)}
+            >
+              <BookOpen size={13} />
+              <span>Notebooks</span>
+            </button>
             <div
               className="mobile-pane-indicator"
               style={{ transform: `translate3d(${mobilePane * 100}%, 0, 0)` }}
@@ -1000,27 +1182,43 @@ export const App: React.FC = () => {
               <div className="mobile-swipe-pane">
                 <AiExplorerPanel />
               </div>
+
+              <div className="mobile-swipe-pane">
+                <NotebookWorkspace
+                  onBackToSpectrogram={() => setMobilePane(1)}
+                  hideBackButton
+                />
+              </div>
             </div>
           </div>
         </>
       ) : (
         <>
-          {activeWin &&
-            activeFile &&
-            (activeFile.isPartialWindow ||
-              isCombinedFileId(activeFile.fileId) ||
-              (activeFile.totalDurationSec ?? activeFile.durationSec) >
-                getSafeMaxWindowSec(activeFile.sampleRate, activeFile.numChannels)) && (
-              <ArchiveTimelineBar win={activeWin} file={activeFile} />
-            )}
+          {workspaceView === 'notebooks' && (
+            <NotebookWorkspace onBackToSpectrogram={() => setWorkspaceView('spectrogram')} />
+          )}
 
-          <div className="workspace-main">
-            <div className="workspace-center">
-              <MDIWorkspace />
-              {showAnnotationDrawer && <AnnotationDrawer />}
+          <div
+            className="nb-spec-host"
+            style={{ display: workspaceView === 'spectrogram' ? 'contents' : 'none' }}
+          >
+            {activeWin &&
+              activeFile &&
+              (activeFile.isPartialWindow ||
+                isCombinedFileId(activeFile.fileId) ||
+                (activeFile.totalDurationSec ?? activeFile.durationSec) >
+                  getSafeMaxWindowSec(activeFile.sampleRate, activeFile.numChannels)) && (
+                <ArchiveTimelineBar win={activeWin} file={activeFile} />
+              )}
+
+            <div className="workspace-main">
+              <div className="workspace-center">
+                <MDIWorkspace />
+                {showAnnotationDrawer && <AnnotationDrawer />}
+              </div>
+              {showSpecPanel && <SpecSettingsPanel />}
+              {showAiPanel && <AiExplorerPanel />}
             </div>
-            {showSpecPanel && <SpecSettingsPanel />}
-            {showAiPanel && <AiExplorerPanel />}
           </div>
         </>
       )}
@@ -1032,6 +1230,16 @@ export const App: React.FC = () => {
       <HotkeyConfigModal />
       <KlipnSaveModal />
       <DetectSoundsModal />
+      <ScriptOutputModal
+        onOpenInNotebook={() =>
+          isMobileViewport ? setMobilePane(3) : setWorkspaceView('notebooks')
+        }
+      />
+      <HelpDocsModal
+        docId={activeHelpDoc}
+        onSelectDoc={setActiveHelpDoc}
+        onClose={() => setActiveHelpDoc(null)}
+      />
     </div>
   );
 };

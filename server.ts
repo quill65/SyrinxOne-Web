@@ -3,6 +3,8 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { aiRouter } from './server/aiRouter.ts';
 import { docsRouter } from './server/docsRouter.ts';
+import { notebookAiRouter } from './server/notebookAiRouter.ts';
+import { pythonKernelRouter } from './server/pythonKernelRouter.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 3000;
@@ -13,6 +15,8 @@ async function startServer() {
 
   app.use(aiRouter);
   app.use(docsRouter);
+  app.use(notebookAiRouter);
+  app.use(pythonKernelRouter);
 
   // Never let unknown /api/* paths fall through to Vite/SPA index.html HTML responses
   app.use('/api', (_req, res) => {
