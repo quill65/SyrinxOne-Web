@@ -1,9 +1,6 @@
 import { create } from 'zustand';
 import {
   DEFAULT_ANNOTATION_FILTER,
-  DEFAULT_DISPLAY_SETTINGS,
-  DEFAULT_HOTKEY_BINDINGS,
-  DEFAULT_SPECTROGRAM_PARAMS,
   HttpAudioEngineClient,
   SPECTROGRAM_FLOOR_MAX,
   SPECTROGRAM_FLOOR_MIN,
@@ -52,215 +49,23 @@ import {
   type SegmentSourceSpec,
 } from '../utils/contiguousArchive';
 import type { ArchiveTargetInput } from '../utils/archiveDocs';
-
-const HOTKEYS_STORAGE_KEY = 'syrinxone.hotkeys.v1';
-const DEFAULTS_STORAGE_KEY = 'syrinxone.windowDefaults.v1';
-const ANNOTATIONS_STORAGE_KEY = 'syrinxone.annotations.v1';
-const ENGINE_STORAGE_KEY = 'syrinxone.engineConfig.v1';
-const ACTIVE_SOURCE_STORAGE_KEY = 'syrinxone.activeSource.v1';
-
-function loadSavedActiveSource(): { sourceId: string; displayName: string } {
-  try {
-    const raw = localStorage.getItem(ACTIVE_SOURCE_STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as { sourceId?: string; displayName?: string };
-      if (typeof parsed.sourceId === 'string' && parsed.sourceId.trim()) {
-        return {
-          sourceId: parsed.sourceId.trim(),
-          displayName:
-            typeof parsed.displayName === 'string' && parsed.displayName.trim()
-              ? parsed.displayName.trim()
-              : parsed.sourceId.trim(),
-        };
-      }
-    }
-  } catch {
-    // ignore storage errors
-  }
-  return { sourceId: 'local', displayName: 'Local Files' };
-}
-
-function loadSavedEngineConfig(): { baseUrl: string; token: string } {
-  const env = (import.meta as unknown as { env?: Record<string, string> }).env;
-  const envUrl = env?.VITE_API_URL || '';
-  const envToken = env?.VITE_API_TOKEN || '';
-  try {
-    const params = new URLSearchParams(window.location.search);
-    const queryApi = params.get('api');
-    const queryToken = params.get('token');
-    if (queryApi || queryToken) {
-      const cfg = {
-        baseUrl: (queryApi ?? envUrl).trim(),
-        token: (queryToken ?? envToken).trim(),
-      };
-      localStorage.setItem(ENGINE_STORAGE_KEY, JSON.stringify(cfg));
-      // Strip sensitive token query parameter from the visible URL bar after persisting
-      if (queryToken && window.history?.replaceState) {
-        params.delete('token');
-        const nextSearch = params.toString();
-        const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`;
-        window.history.replaceState({}, '', nextUrl);
-      }
-      return cfg;
-    }
-    const raw = localStorage.getItem(ENGINE_STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as { baseUrl?: string; token?: string };
-      return {
-        baseUrl:
-          typeof parsed.baseUrl === 'string' && parsed.baseUrl.length > 0
-            ? parsed.baseUrl
-            : envUrl,
-        token: typeof parsed.token === 'string' ? parsed.token : envToken,
-      };
-    }
-  } catch {
-    // ignore storage/window errors (e.g., SSR/tests)
-  }
-  return { baseUrl: envUrl, token: envToken };
-}
-
-function isNarrowMobileViewport(): boolean {
-  try {
-    return typeof window !== 'undefined' && window.innerWidth <= 768;
-  } catch {
-    return false;
-  }
-}
-
-function loadSavedAnnotations(): {
-  annotations: AnnotationRecord[];
-  nonAnnotationLines: string[];
-} {
-  try {
-    const raw = localStorage.getItem(ANNOTATIONS_STORAGE_KEY);
-    if (!raw) return { annotations: [], nonAnnotationLines: [] };
-    const parsed = JSON.parse(raw) as {
-      annotations?: AnnotationRecord[];
-      nonAnnotationLines?: string[];
-    };
-    return {
-      annotations: Array.isArray(parsed.annotations) ? parsed.annotations : [],
-      nonAnnotationLines: Array.isArray(parsed.nonAnnotationLines)
-        ? parsed.nonAnnotationLines
-        : [],
-    };
-  } catch {
-    return { annotations: [], nonAnnotationLines: [] };
-  }
-}
-
-function persistAnnotations(
-  annotations: AnnotationRecord[],
-  nonAnnotationLines: string[],
-): void {
-  try {
-    localStorage.setItem(
-      ANNOTATIONS_STORAGE_KEY,
-      JSON.stringify({ annotations, nonAnnotationLines }),
-    );
-  } catch {
-    // ignore storage quota errors
-  }
-}
-
-function loadSavedHotkeys(): HotkeyBinding[] {
-  try {
-    const raw = localStorage.getItem(HOTKEYS_STORAGE_KEY);
-    if (!raw) return DEFAULT_HOTKEY_BINDINGS;
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) && parsed.length > 0) return parsed as HotkeyBinding[];
-  } catch {
-    // ignore storage errors
-  }
-  return DEFAULT_HOTKEY_BINDINGS;
-}
-
-function sanitizeDisplaySettings(raw?: Partial<DisplaySettings>): DisplaySettings {
-  const merged = { ...DEFAULT_DISPLAY_SETTINGS, ...(raw ?? {}) };
-  const rawRows = Number(merged.splitTimeRows);
-  const rawGain = Number(merged.gainDb);
-  const rawFloor = Number(merged.floor);
-  return {
-    colormap: merged.colormap,
-    gainDb: Number.isFinite(rawGain)
-      ? Math.max(SPECTROGRAM_GAIN_MIN_DB, Math.min(SPECTROGRAM_GAIN_MAX_DB, Math.round(rawGain)))
-      : DEFAULT_DISPLAY_SETTINGS.gainDb,
-    floor: Number.isFinite(rawFloor)
-      ? Math.max(SPECTROGRAM_FLOOR_MIN, Math.min(SPECTROGRAM_FLOOR_MAX, Math.round(rawFloor)))
-      : DEFAULT_DISPLAY_SETTINGS.floor,
-    renderMode: merged.renderMode,
-    timeScaleMode: merged.timeScaleMode,
-    msPerPixel: merged.msPerPixel,
-    showWaveform: Boolean(merged.showWaveform),
-    showAxes: Boolean(merged.showAxes),
-    showGrid: Boolean(merged.showGrid),
-    showAnnotations: Boolean(merged.showAnnotations),
-    showCursors: Boolean(merged.showCursors),
-    lockSettings: Boolean(merged.lockSettings),
-    interpolation: merged.interpolation,
-    splitTimeRows: Number.isFinite(rawRows) ? Math.max(1, Math.min(10, Math.round(rawRows))) : 1,
-    stackAllChannels: Boolean(merged.stackAllChannels),
-  };
-}
-
-function sanitizeSpecParams(raw?: Partial<SpectrogramParams>): SpectrogramParams {
-  return {
-    ...DEFAULT_SPECTROGRAM_PARAMS,
-    ...(raw ?? {}),
-    dspMode: 'modern_stft',
-  };
-}
-
-function loadSavedDefaults(): {
-  specParams: SpectrogramParams;
-  displaySettings: DisplaySettings;
-  autoGainMode: AutoGainMode;
-} {
-  try {
-    const raw = localStorage.getItem(DEFAULTS_STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as {
-        specParams?: Partial<SpectrogramParams>;
-        displaySettings?: Partial<DisplaySettings>;
-        autoGainMode?: AutoGainMode;
-      };
-      const autoGainMode = normalizeAutoGainMode(parsed.autoGainMode);
-      return {
-        specParams: sanitizeSpecParams(parsed.specParams),
-        displaySettings: sanitizeDisplaySettings(parsed.displaySettings),
-        autoGainMode,
-      };
-    }
-  } catch {
-    // ignore
-  }
-  return {
-    specParams: sanitizeSpecParams(),
-    displaySettings: { ...DEFAULT_DISPLAY_SETTINGS },
-    autoGainMode: 'manual',
-  };
-}
-
-function makeSpecCacheKey(fileId: string, params: SpectrogramParams): string {
-  return [
-    fileId,
-    params.channel,
-    params.fftSize,
-    params.hopSize,
-    params.windowType,
-    params.dspMode,
-    params.popFilter ? 1 : 0,
-  ].join('|');
-}
-
-function parentPrefix(uri: string): string {
-  const norm = uri.replace(/\\/g, '/');
-  const idx = norm.lastIndexOf('/');
-  if (idx <= 0) return '';
-  const dir = uri.slice(0, idx);
-  return dir.endsWith(':') ? `${dir}\\` : dir;
-}
+import {
+  isNarrowMobileViewport,
+  loadSavedActiveSource,
+  loadSavedAnnotations,
+  loadSavedDefaults,
+  loadSavedEngineConfig,
+  loadSavedHotkeys,
+  makeSpecCacheKey,
+  parentPrefix,
+  persistActiveSource,
+  persistAnnotations,
+  persistEngineConfig,
+  persistHotkeys,
+  persistWindowDefaults,
+  sanitizeDisplaySettings,
+  sanitizeSpecParams,
+} from './persistence';
 
 const viewSaveTimers = new Map<string, number>();
 
@@ -592,14 +397,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
           : cleanId === 'http'
             ? 'Direct URL'
             : cleanId);
-    try {
-      localStorage.setItem(
-        ACTIVE_SOURCE_STORAGE_KEY,
-        JSON.stringify({ sourceId: cleanId, displayName: cleanLabel }),
-      );
-    } catch {
-      // ignore storage errors
-    }
+    persistActiveSource(cleanId, cleanLabel);
     set({ activeSourceId: cleanId, activeSourceDisplayName: cleanLabel });
   },
 
@@ -644,14 +442,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     const cleanUrl = baseUrl.trim().replace(/\/+$/, '');
     const cleanToken = (token ?? '').trim();
     get().engine.setConfig({ baseUrl: cleanUrl, token: cleanToken || undefined });
-    try {
-      localStorage.setItem(
-        ENGINE_STORAGE_KEY,
-        JSON.stringify({ baseUrl: cleanUrl, token: cleanToken }),
-      );
-    } catch {
-      // ignore
-    }
+    persistEngineConfig(cleanUrl, cleanToken);
     set({ backendUrl: cleanUrl, backendToken: cleanToken });
   },
 
@@ -1611,14 +1402,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     const specParams = sanitizeSpecParams(src.specParams);
     const displaySettings = { ...src.displaySettings, lockSettings: false };
     const autoGainMode = state.windowAutoGainMode[sourceWindowId] ?? 'manual';
-    try {
-      localStorage.setItem(
-        DEFAULTS_STORAGE_KEY,
-        JSON.stringify({ specParams, displaySettings, autoGainMode }),
-      );
-    } catch {
-      // ignore
-    }
+    persistWindowDefaults(specParams, displaySettings, autoGainMode);
     set({
       defaultSpecParams: specParams,
       defaultDisplaySettings: displaySettings,
@@ -1996,11 +1780,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => {
     set((s) => ({ annotationFilter: { ...s.annotationFilter, ...patch } })),
 
   setHotkeys: (bindings) => {
-    try {
-      localStorage.setItem(HOTKEYS_STORAGE_KEY, JSON.stringify(bindings));
-    } catch {
-      // ignore
-    }
+    persistHotkeys(bindings);
     set({ hotkeys: bindings });
   },
 
